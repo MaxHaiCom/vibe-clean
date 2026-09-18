@@ -2,18 +2,21 @@ import Cocoa
 import SwiftUI
 import ServiceManagement
 import UserNotifications
+import os
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var menu: NSMenu!
     private var timer: Timer?
     private var autoCleanTimer: Timer?
-    
+
     private var currentReport = ScanReport()
-    
+    private weak var hostingView: NSHostingView<DashboardView>?
+    private let log = Logger(subsystem: "com.haifeng.vibeclean", category: "menu")
+
     // UserDefaults Keys
     private let autoCleanKey = "autoCleanEnabled"
-    
+
     var isAutoCleanEnabled: Bool {
         get { UserDefaults.standard.bool(forKey: autoCleanKey) }
         set {
@@ -21,90 +24,96 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             setupAutoCleanTimer()
         }
     }
-    
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        
+
         menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
-        
+
+        DispatchQueue.global(qos: .utility).async { ProxyManager.shared.syncIfInstalled() }   // 包里脚本更新了就热替换
         updateStatus()
-        
+
         timer = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: true) { [weak self] _ in
             self?.updateStatus()
         }
-        
+
         setupAutoCleanTimer()
     }
-    
+
     private func setupAutoCleanTimer() {
         autoCleanTimer?.invalidate()
         autoCleanTimer = nil
-        
+
         if isAutoCleanEnabled {
             autoCleanTimer = Timer.scheduledTimer(withTimeInterval: 1800.0, repeats: true) { [weak self] _ in
                 self?.performSilentAutoClean()
             }
         }
     }
-    
+
     private func performSilentAutoClean() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let report = ProcessScanner.shared.scan()
             if !report.allOrphanPids.isEmpty {
-                let result = ProcessScanner.shared.killProcesses(pids: report.allOrphanPids)
+                let killed = ProcessScanner.shared.killProcesses(pids: report.allOrphanPids)
                 DispatchQueue.main.async {
                     self?.sendNotification(
                         title: "VibeClean 内存优化",
-                        body: "已静默清理 \(result.killedCount) 个残留 AI 进程，回收 \(String(format: "%.1f", result.freedMB)) MB 内存。"
+                        body: "已静默清理 \(killed) 个残留 AI 进程，回收 \(String(format: "%.1f", report.totalOrphanMemMB)) MB 内存。"
                     )
                     self?.updateStatus()
                 }
             }
         }
     }
-    
+
     private func sendNotification(title: String, body: String) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
-        
+
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }
-    
+
+    private var isScanning = false
+
     @objc func updateStatus() {
+        guard !isScanning else { return }   // 首扫可能 4s+，别让 8s 定时器堆积
+        isScanning = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let report = ProcessScanner.shared.scan()
             DispatchQueue.main.async {
+                self?.isScanning = false
                 self?.currentReport = report
                 self?.renderStatusButton(report: report)
             }
         }
     }
-    
+
     // MARK: - 芯片框架图标 (内嵌居中数字)
     private func renderChipFrameImage(percentage: Int) -> NSImage {
         let width: CGFloat = 25.0
         let height: CGFloat = 22.0
-        
+
         let img = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
             let bodyWidth: CGFloat = 19.5
             let bodyHeight: CGFloat = 13.0
             let bodyX: CGFloat = (width - bodyWidth) / 2.0
             let bodyY: CGFloat = (height - bodyHeight) / 2.0
-            
+
             // 1. 芯片主体轮廓
             let bodyRect = NSRect(x: bodyX, y: bodyY, width: bodyWidth, height: bodyHeight)
             let bodyPath = NSBezierPath(roundedRect: bodyRect, xRadius: 2.8, yRadius: 2.8)
             bodyPath.lineWidth = 1.2
             NSColor.black.setStroke()
             bodyPath.stroke()
-            
+
             // 2. 芯片四周引脚 (上下各 3 个金属引脚)
             let pinW: CGFloat = 1.5
             let pinH: CGFloat = 1.8
@@ -115,7 +124,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSBezierPath(roundedRect: NSRect(x: px, y: bodyY + bodyHeight, width: pinW, height: pinH), xRadius: 0.5, yRadius: 0.5).fill()
                 NSBezierPath(roundedRect: NSRect(x: px, y: bodyY - pinH, width: pinW, height: pinH), xRadius: 0.5, yRadius: 0.5).fill()
             }
-            
+
             // 3. 内部进度轻量填充
             let pad: CGFloat = 1.6
             let maxW = bodyWidth - (pad * 2)
@@ -126,7 +135,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSColor.black.withAlphaComponent(0.22).setFill()
                 fillPath.fill()
             }
-            
+
             // 4. 居中数字
             let text = "\(percentage)"
             let fontSize: CGFloat = (percentage >= 100) ? 7.2 : 8.5
@@ -144,11 +153,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             text.draw(in: textRect, withAttributes: attrs)
             return true
         }
-        
+
         img.isTemplate = true
         return img
     }
-    
+
     private func renderStatusButton(report: ScanReport) {
         guard let button = statusItem.button else { return }
         button.image = renderChipFrameImage(percentage: report.freePercentage)
@@ -156,132 +165,147 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.title = ""
         button.attributedTitle = NSAttributedString(string: "")
     }
-    
-    // MARK: - NSMenuDelegate (嵌入 SwiftUI 图表卡片)
+
+    // MARK: - NSMenuDelegate (嵌入 SwiftUI 面板)
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        
-        // 极速同步当前活跃会话，确保菜单弹出的第一帧即是最新实时状态
-        var report = currentReport
-        report.detectedLLMs = ProcessScanner.shared.scanActiveLLMs()
-        currentReport = report
-        
-        // 1. SwiftUI 图表面板项 (彻底解决灰色纯文本割裂感)
+
+        // 菜单弹出直接用 ≤8s 前的缓存快照，主线程不做任何扫描；DashboardView.onAppear 会立刻在后台刷一次
+        let report = currentReport
+
+        // 面板（Tab 切换，高度随当前 Tab 内容自适应，超过屏幕才滚动）。所有动作都在面板里，菜单只留退出。
+        var actions = PanelActions()
+        actions.cleanOrphans = { [weak self] in
+            self?.menu.cancelTracking()
+            self?.cleanOrphansAction()
+        }
+        actions.cleanNPX = { [weak self] in
+            self?.menu.cancelTracking()
+            self?.cleanNPXAction()
+        }
+        actions.rescan = { [weak self] in self?.updateStatus() }
+        actions.setAutoClean = { [weak self] on in self?.isAutoCleanEnabled = on }
+        actions.setLaunchAtLogin = { [weak self] on in self?.setLaunchAtLogin(on) }
+        actions.installProxy = { [weak self] in
+            self?.menu.cancelTracking()
+            self?.installProxy()
+        }
+        actions.uninstallProxy = { [weak self] in
+            self?.menu.cancelTracking()
+            self?.uninstallProxy()
+        }
+        actions.copyProxyPrefix = { [weak self] in self?.copyProxyPrefix() }
+        actions.relayout = { [weak self] in self?.relayoutMenuPanel() }
+
         let dashboard = DashboardView(
             report: report,
-            onCleanOrphans: { [weak self] in
-                self?.menu.cancelTracking()
-                self?.cleanOrphansAction()
-            },
-            onCleanNPX: { [weak self] in
-                self?.menu.cancelTracking()
-                self?.cleanNPXAction()
-            }
+            settings: PanelSettings(autoClean: isAutoCleanEnabled, launchAtLogin: isLaunchAtLoginEnabled()),
+            actions: actions
         )
-        
+
         let hosting = NSHostingView(rootView: dashboard)
         hosting.frame = NSRect(origin: .zero, size: hosting.fittingSize)
-        
+        hostingView = hosting
+
         let cardItem = NSMenuItem()
         cardItem.view = hosting
         menu.addItem(cardItem)
-        
-        // 2. 可选：若有孤儿进程，提供展开明细选项
-        if !report.orphanedGroups.isEmpty {
-            let detailSubmenu = NSMenu()
-            for group in report.orphanedGroups {
-                let groupMem = group.totalMemMB > 1024
-                    ? String(format: "%.1f GB", group.totalMemMB / 1024.0)
-                    : "\(Int(group.totalMemMB)) MB"
-                let subTitle = "\(group.serviceName) (\(groupMem) · \(group.processCount) 个进程)"
-                let subItem = NSMenuItem(title: subTitle, action: nil, keyEquivalent: "")
-                subItem.isEnabled = false
-                detailSubmenu.addItem(subItem)
-            }
-            
-            let detailMenuItem = NSMenuItem(title: "查看断链服务明细...", action: nil, keyEquivalent: "")
-            detailMenuItem.submenu = detailSubmenu
-            menu.addItem(detailMenuItem)
-        }
-        
+
         menu.addItem(NSMenuItem.separator())
-        
-        // 3. 偏好选项
-        let autoCleanItem = NSMenuItem(title: "定时自动清理 (每 30 分钟)", action: #selector(toggleAutoClean), keyEquivalent: "")
-        autoCleanItem.target = self
-        autoCleanItem.state = isAutoCleanEnabled ? .on : .off
-        menu.addItem(autoCleanItem)
-        
-        let launchItem = NSMenuItem(title: "登录时自动启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
-        launchItem.target = self
-        launchItem.state = isLaunchAtLoginEnabled() ? .on : .off
-        menu.addItem(launchItem)
-        
-        menu.addItem(NSMenuItem.separator())
-        
-        // 4. 控制操作
-        let refreshItem = NSMenuItem(title: "重新扫描", action: #selector(refreshAction), keyEquivalent: "r")
-        refreshItem.target = self
-        menu.addItem(refreshItem)
-        
+
         let quitItem = NSMenuItem(title: "退出 VibeClean", action: #selector(quitAction), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
     }
-    
+
+    /// 内容高度变了（切 Tab / 数据到达 / 卡片增减）→ 按新 fittingSize 改 frame。
+    /// 实测 macOS 14：NSMenu 打开后会跟着自定义视图的 frame 实时重排（菜单窗口高度随之变），不需要关掉重开。
+    private func relayoutMenuPanel() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let h = self.hostingView else { return }
+            let size = h.fittingSize
+            guard abs(size.height - h.frame.height) > 1 else { return }
+            let before = h.window?.frame.height ?? -1
+            h.frame.size = size
+            self.log.debug("relayout fitting=\(Int(size.height)) menuWindow before=\(Int(before))")
+        }
+    }
+
     // MARK: - Actions
+    // kill 里有 300ms 等待，rm -rf 走盘：都不在主线程做
     @objc func cleanOrphansAction() {
         let pids = currentReport.allOrphanPids
+        let memMB = currentReport.totalOrphanMemMB
         guard !pids.isEmpty else { return }
-        
-        let result = ProcessScanner.shared.killProcesses(pids: pids)
-        sendNotification(
-            title: "清理完成",
-            body: "已释放 \(result.killedCount) 个残留 AI 进程，回收 \(String(format: "%.1f", result.freedMB)) MB 内存。"
-        )
-        updateStatus()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let killed = ProcessScanner.shared.killProcesses(pids: pids)
+            DispatchQueue.main.async {
+                self?.sendNotification(
+                    title: "清理完成",
+                    body: "已释放 \(killed) 个残留 AI 进程，回收 \(String(format: "%.1f", memMB)) MB 内存。"
+                )
+                self?.updateStatus()
+            }
+        }
     }
-    
+
     @objc func cleanNPXAction() {
-        let freedMB = ProcessScanner.shared.cleanNPXCache()
-        sendNotification(
-            title: "NPX 缓存已清理",
-            body: "已清空 ~/.npm/_npx 目录，释放约 \(String(format: "%.1f", freedMB)) MB 磁盘空间。"
-        )
-        updateStatus()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let freedMB = ProcessScanner.shared.cleanNPXCache()
+            DispatchQueue.main.async {
+                self?.sendNotification(
+                    title: "NPX 缓存已清理",
+                    body: "已清空 ~/.npm/_npx 目录，释放约 \(String(format: "%.1f", freedMB)) MB 磁盘空间。"
+                )
+                self?.updateStatus()
+            }
+        }
     }
-    
-    @objc func toggleAutoClean() {
-        isAutoCleanEnabled.toggle()
-        updateStatus()
+
+    func installProxy() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var msg = "已安装并启动，前缀 \(ProxyManager.shared.prefix)，登录自启。"
+            do { try ProxyManager.shared.install() } catch { msg = "安装失败：\(error.localizedDescription)" }
+            DispatchQueue.main.async {
+                self?.sendNotification(title: "API 记账代理", body: msg)
+                self?.updateStatus()
+            }
+        }
     }
-    
-    @objc func toggleLaunchAtLogin() {
+
+    func uninstallProxy() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            ProxyManager.shared.uninstall()
+            DispatchQueue.main.async {
+                self?.sendNotification(title: "API 记账代理", body: "已停止并卸载。记账文件保留在 ~/.config/vibeclean/。")
+                self?.updateStatus()
+            }
+        }
+    }
+
+    func copyProxyPrefix() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(ProxyManager.shared.prefix, forType: .string)
+    }
+
+    private func setLaunchAtLogin(_ on: Bool) {
         if #available(macOS 13.0, *) {
             do {
-                if isLaunchAtLoginEnabled() {
-                    try SMAppService.mainApp.unregister()
-                } else {
-                    try SMAppService.mainApp.register()
-                }
+                if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
             } catch {
                 print("Toggle launch error: \(error)")
             }
         }
-        updateStatus()
     }
-    
+
     private func isLaunchAtLoginEnabled() -> Bool {
         if #available(macOS 13.0, *) {
             return SMAppService.mainApp.status == .enabled
         }
         return false
     }
-    
-    @objc func refreshAction() {
-        updateStatus()
-    }
-    
+
     @objc func quitAction() {
         NSApplication.shared.terminate(nil)
     }

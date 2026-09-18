@@ -3,3 +3,5 @@ VibeClean.app/
 VibeClean
 *.o
 *.iconset/
+.claude/
+*.bak
