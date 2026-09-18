@@ -1,5 +1,6 @@
 import Cocoa
 import SwiftUI
+import os
 
 struct MiniProgressBar: View {
     var value: Double
@@ -17,6 +18,76 @@ struct MiniProgressBar: View {
             RoundedRectangle(cornerRadius: height / 2)
                 .fill(color)
                 .frame(width: max(1.5, width * CGFloat(safeRatio)), height: height)
+        }
+    }
+}
+
+/// 承接滚动的容器。**必须放在这一层**：macOS 只把滚动事件派给光标下最深的可滚动视图，
+/// SwiftUI 的 ScrollView 会吞掉它，挂在外层 NSHostingView 上收不到。
+/// 横向为主 → 切 Tab 并吞事件；其余交给正常纵向滚动。
+final class SwipeScrollView: NSScrollView {
+    var onSwipe: ((Int) -> Void)?
+    private let log = Logger(subsystem: "com.haifeng.vibegauge", category: "swipe")
+    private var accum: CGFloat = 0
+    private var lastAt: TimeInterval = 0
+    private var armed = true          // 一次物理手势只允许触发一次（否则一次滑动会连跳两步）
+
+    override func scrollWheel(with e: NSEvent) {
+        let dx = e.scrollingDeltaX      // AppKit 已按用户的「自然滚动」设置给过方向，别再取反
+        let dy = e.scrollingDeltaY
+        let hasPhase = e.phase != [] || e.momentumPhase != []
+        if e.phase == .began { accum = 0; armed = true }
+
+        guard abs(dx) > abs(dy) * 1.5 else {
+            accum = 0
+            super.scrollWheel(with: e)
+            return
+        }
+        guard e.momentumPhase == [] else { return }          // 惯性阶段只吞掉
+        if hasPhase && !armed { return }                     // 本次手势已触发过，剩下的事件全吞掉
+
+        accum += dx
+        let threshold: CGFloat = e.hasPreciseScrollingDeltas ? 45 : 3
+        let now = Date().timeIntervalSince1970
+        if abs(accum) >= threshold, now - lastAt > 0.25 {
+            let step = accum < 0 ? 1 : -1                    // 向左滑 = 下一步；向右滑 = 上一步/返回
+            log.debug("swipe accum=\(self.accum) step=\(step) phase=\(e.phase.rawValue)")
+            accum = 0
+            lastAt = now
+            if hasPhase { armed = false }
+            onSwipe?(step)
+        }
+    }
+}
+
+struct SwipeScroll<Content: View>: NSViewRepresentable {
+    let content: Content
+    let onSwipe: (Int) -> Void
+    let onHeight: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> SwipeScrollView {
+        let sv = SwipeScrollView()
+        sv.hasVerticalScroller = true
+        sv.autohidesScrollers = true
+        sv.drawsBackground = false
+        sv.onSwipe = onSwipe
+        let host = NSHostingView(rootView: content)
+        host.translatesAutoresizingMaskIntoConstraints = false
+        sv.documentView = host
+        NSLayoutConstraint.activate([
+            host.topAnchor.constraint(equalTo: sv.contentView.topAnchor),
+            host.leadingAnchor.constraint(equalTo: sv.contentView.leadingAnchor),
+            host.widthAnchor.constraint(equalTo: sv.contentView.widthAnchor)
+        ])
+        return sv
+    }
+
+    func updateNSView(_ sv: SwipeScrollView, context: Context) {
+        sv.onSwipe = onSwipe
+        if let host = sv.documentView as? NSHostingView<Content> {
+            host.rootView = content
+            let h = host.fittingSize.height
+            DispatchQueue.main.async { onHeight(h) }          // 内容高度回传，外层据此定高
         }
     }
 }
@@ -55,8 +126,10 @@ public struct DashboardView: View {
     /// 内容区上限：屏幕可用高度减去菜单外壳/Tab 栏/退出项；不到上限就按内容高度，超过才滚动
     static var maxContentHeight: CGFloat { max(300, (NSScreen.main?.visibleFrame.height ?? 900) - 170) }
 
-    @AppStorage("vc.tab") private var tab: Int = 0
+    @AppStorage("vg.tab") private var tab: Int = 0
     @State private var expandedCards: Set<String> = []
+    @State private var measuredHeight: CGFloat = 400
+    @State private var drillDown: String? = nil      // 非空 = 正在看某个平台的详情页
     @State private var autoCleanOn: Bool
     @State private var launchAtLoginOn: Bool
 
@@ -193,19 +266,34 @@ public struct DashboardView: View {
         VStack(alignment: .leading, spacing: 8) {
             // Tab 栏 + 右侧一行状态
             HStack(spacing: 8) {
-                Picker("", selection: $tab) {
-                    Text("订阅").tag(0)
-                    Text("API").tag(1)
-                    Text("系统").tag(2)
+                if let name = drillDown {
+                    Button(action: { withAnimation(.easeInOut(duration: 0.15)) { drillDown = nil } }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "chevron.left").font(.system(size: 9, weight: .bold))
+                            Text("返回").font(.system(size: 10, weight: .medium))
+                        }
+                        .foregroundColor(.blue)
+                    }
+                    .buttonStyle(.plain)
+                    Text(name)
+                        .font(.system(size: 11, weight: .bold))
+                    Spacer()
+                } else {
+                    Picker("", selection: $tab) {
+                        Text("订阅").tag(0)
+                        Text("API").tag(1)
+                        Text("系统").tag(2)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .frame(width: 150)
+                    .help("也可以在面板上用触控板左右滑动切换")
+
+                    Spacer()
+
+                    tabStatusLine
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .controlSize(.small)
-                .frame(width: 150)
-
-                Spacer()
-
-                tabStatusLine
 
                 Button(action: actions.rescan) {
                     Image(systemName: "arrow.clockwise")
@@ -216,25 +304,36 @@ public struct DashboardView: View {
                 .help("重新扫描")
             }
 
-            ScrollView(.vertical, showsIndicators: true) {
-                VStack(alignment: .leading, spacing: 10) {
-                    switch tab {
-                    case 1: apiSection
-                    case 2:
-                        actionSection
-                        hardwareSection
-                        settingsSection
-                    default: aiSection
+            SwipeScroll(
+                content: VStack(alignment: .leading, spacing: 10) {
+                    if let name = drillDown, let llm = currentLLMs.first(where: { $0.name == name }) {
+                        detailPage(for: llm)
+                    } else {
+                        switch tab {
+                        case 1: apiSection
+                        case 2:
+                            actionSection
+                            hardwareSection
+                            settingsSection
+                        default: aiSection
+                        }
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .frame(maxHeight: Self.maxContentHeight)
+                .frame(width: Self.panelWidth - 24, alignment: .leading),
+                onSwipe: { step in
+                    guard drillDown == nil else { return }   // 详情页里不响应滑动，只用「返回」按钮
+                    let next = max(0, min(2, tab + step))
+                    if next != tab { tab = next }
+                },
+                onHeight: { h in if abs(h - measuredHeight) > 1 { measuredHeight = h } }
+            )
+            .frame(width: Self.panelWidth - 24, height: min(max(measuredHeight, 360), Self.maxContentHeight))
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .frame(width: Self.panelWidth)
         .onChange(of: tab) { _, _ in actions.relayout() }
+        .onChange(of: measuredHeight) { _, _ in actions.relayout() }
         .onReceive(liveTicker) { date in
             liveNow = date
             pulseAnim.toggle()
@@ -970,6 +1069,8 @@ public struct DashboardView: View {
         .padding(.vertical, 5)
         .background(llm.isRunning ? Color.secondary.opacity(0.08) : Color.secondary.opacity(0.03))
         .cornerRadius(6)
+        .contentShape(Rectangle())
+        .onTapGesture { openDetail(llm) }
     }
 
     // 整行卡片（双池：原生池 + 三方池）
@@ -1024,5 +1125,232 @@ public struct DashboardView: View {
         .padding(.vertical, 5)
         .background(llm.isRunning ? Color.secondary.opacity(0.08) : Color.secondary.opacity(0.03))
         .cornerRadius(6)
+        .contentShape(Rectangle())
+        .onTapGesture { openDetail(llm) }
+    }
+
+    // MARK: - 详情页
+
+    /// 大号额度环：外圈已用比例，中间百分比，下面窗口名 + 重置倒计时
+    @ViewBuilder
+    private func quotaRing(label: String, win: QuotaWindow, size: CGFloat = 78) -> some View {
+        let pct = win.effectivePct(now: nowTS)
+        let color = quotaColor(pct)
+        VStack(spacing: 4) {
+            ZStack {
+                Circle()
+                    .stroke(Color.secondary.opacity(0.18), lineWidth: 7)
+                Circle()
+                    .trim(from: 0, to: max(0.004, Double(pct) / 100.0))
+                    .stroke(color, style: StrokeStyle(lineWidth: 7, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                VStack(spacing: 0) {
+                    Text("\(pct)")
+                        .font(.system(size: 21, weight: .bold, design: .rounded))
+                        .foregroundColor(pct > 80 ? color : .primary)
+                    Text("% 已用")
+                        .font(.system(size: 7))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .frame(width: size, height: size)
+
+            Text(label)
+                .font(.system(size: 9.5, weight: .semibold))
+            if let c = Fmt.countdown(to: win.resetsAt, now: nowTS) {
+                Text("重置 \(c)")
+                    .font(.system(size: 8))
+                    .foregroundColor(.secondary)
+            }
+            if let a = win.ageSeconds(now: nowTS) {
+                Text("记录于 \(Fmt.agoShort(a))")
+                    .font(.system(size: 7.5))
+                    .foregroundColor(a > 300 ? .orange : .secondary.opacity(0.75))
+            }
+        }
+    }
+
+    private func sectionTitle(_ t: String) -> some View {
+        Text(t)
+            .font(.system(size: 9.5, weight: .bold))
+            .foregroundColor(.secondary)
+    }
+
+    private func card<T: View>(@ViewBuilder _ content: () -> T) -> some View {
+        VStack(alignment: .leading, spacing: 6) { content() }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            .background(Color.secondary.opacity(0.06))
+            .cornerRadius(8)
+    }
+
+    @ViewBuilder
+    private func detailPage(for llm: DetectedLLMRuntime) -> some View {
+        let d = llm.platformDetail
+
+        // 1. 额度环
+        if llm.hasQuota {
+            card {
+                HStack(alignment: .top, spacing: 0) {
+                    if let fh = llm.fiveHour {
+                        quotaRing(label: "5 小时窗口", win: fh).frame(maxWidth: .infinity)
+                    }
+                    if let sd = llm.sevenDay {
+                        quotaRing(label: llm.name == "Grok" ? "周窗口" : "7 天窗口", win: sd).frame(maxWidth: .infinity)
+                    }
+                    if let sf = llm.secondaryFiveHour {
+                        quotaRing(label: "\(llm.secondaryPoolName) 5H", win: sf).frame(maxWidth: .infinity)
+                    }
+                    if let sw = llm.secondarySevenDay {
+                        quotaRing(label: "\(llm.secondaryPoolName)池 周", win: sw).frame(maxWidth: .infinity)
+                    }
+                }
+            }
+        }
+
+        // 2. 其他额度桶（Codex 的 Spark 等）
+        if !d.extraPools.isEmpty {
+            card {
+                sectionTitle("其他额度桶（主卡未显示）")
+                ForEach(Array(d.extraPools.enumerated()), id: \.offset) { _, item in
+                    HStack(spacing: 4) {
+                        Text(item.0).font(.system(size: 9)).foregroundColor(.secondary).lineLimit(1)
+                        Spacer(minLength: 4)
+                        let pct = item.1.effectivePct(now: nowTS)
+                        MiniProgressBar(value: Double(pct) / 100.0, color: quotaColor(pct), width: 40, height: 4)
+                        Text("\(pct)%").font(.system(size: 9, weight: .bold)).fixedSize()
+                        if let c = Fmt.countdown(to: item.1.resetsAt, now: nowTS) {
+                            Text(c).font(.system(size: 7.5)).foregroundColor(.secondary).fixedSize()
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. 订阅 / 账号信息
+        if !d.rows.isEmpty {
+            card {
+                HStack {
+                    sectionTitle("订阅与账号")
+                    Spacer()
+                    if !llm.tier.isEmpty {
+                        Text(llm.tier)
+                            .font(.system(size: 8, weight: .bold))
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(tierColor(llm.tier).opacity(0.18))
+                            .foregroundColor(tierColor(llm.tier))
+                            .cornerRadius(3)
+                    }
+                }
+                ForEach(Array(d.rows.enumerated()), id: \.offset) { _, row in
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(row.0)
+                            .font(.system(size: 8.5))
+                            .foregroundColor(.secondary)
+                            .frame(width: 96, alignment: .leading)
+                        Text(row.1)
+                            .font(.system(size: 8.5, design: .monospaced))
+                            .foregroundColor(.primary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+        }
+
+        // 4. 活跃会话
+        if !d.sessions.isEmpty {
+            card {
+                HStack {
+                    sectionTitle("活跃会话")
+                    Spacer()
+                    Text("\(d.sessions.count) 个").font(.system(size: 8)).foregroundColor(.secondary)
+                }
+                ForEach(d.sessions) { se in
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 4) {
+                            Circle().fill(Color.green).frame(width: 4, height: 4)
+                            Text(shortPath(se.cwd))
+                                .font(.system(size: 8.5, weight: .medium))
+                                .lineLimit(1)
+                                .truncationMode(.head)
+                            Spacer(minLength: 4)
+                            Text(Fmt.agoShort(se.startedAgo).replacingOccurrences(of: "前", with: ""))
+                                .font(.system(size: 8)).foregroundColor(.secondary).fixedSize()
+                            Text(String(format: "%.0f MB", se.memMB))
+                                .font(.system(size: 8)).foregroundColor(.secondary).fixedSize()
+                        }
+                        Text("pid \(se.pid)")
+                            .font(.system(size: 7, design: .monospaced))
+                            .foregroundColor(.secondary.opacity(0.7))
+                    }
+                    .padding(.vertical, 1)
+                }
+            }
+        }
+
+        // 5. 今日用量（该平台自己的）
+        if let u = currentCLI.first(where: { $0.name.hasPrefix(llm.name) || llm.name.hasPrefix($0.name.replacingOccurrences(of: " Code", with: "")) }) {
+            card {
+                sectionTitle("今日用量")
+                if u.hasTokens {
+                    HStack(spacing: 0) {
+                        detailMetric("上下文", formatTokens(u.ctx))
+                        detailMetric("输出", formatTokens(u.out))
+                        detailMetric("思考", formatTokens(u.think))
+                        detailMetric("调用", "\(u.requests)")
+                    }
+                    HStack(spacing: 4) {
+                        Text("缓存命中").font(.system(size: 8)).foregroundColor(.secondary)
+                        GeometryReader { geo in
+                            ZStack(alignment: .leading) {
+                                RoundedRectangle(cornerRadius: 2).fill(Color.secondary.opacity(0.18)).frame(height: 5)
+                                RoundedRectangle(cornerRadius: 2).fill(Color.green.opacity(0.85))
+                                    .frame(width: geo.size.width * CGFloat(max(0.01, min(1, u.cacheHitRate / 100))), height: 5)
+                            }
+                        }
+                        .frame(height: 5)
+                        Text(String(format: "%.1f%%", u.cacheHitRate))
+                            .font(.system(size: 8, weight: .bold)).fixedSize()
+                    }
+                } else {
+                    Text(u.turns > 0 ? "\(u.turns) 轮 · \(u.note)" : u.note)
+                        .font(.system(size: 8.5)).foregroundColor(.secondary)
+                }
+            }
+        }
+
+        // 6. 数据来源
+        if !d.sourceFiles.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                sectionTitle("数据来源（只读本机文件）")
+                ForEach(d.sourceFiles, id: \.self) { f in
+                    Text(f).font(.system(size: 7.5, design: .monospaced)).foregroundColor(.secondary.opacity(0.8)).lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 4)
+        }
+    }
+
+    private func detailMetric(_ label: String, _ value: String) -> some View {
+        VStack(spacing: 1) {
+            Text(value).font(.system(size: 12, weight: .bold, design: .rounded))
+            Text(label).font(.system(size: 7.5)).foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// /Users/x/Desktop/code/foo → ~/…/code/foo
+    private func shortPath(_ p: String) -> String {
+        var s = p.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~")
+        let parts = s.split(separator: "/")
+        if parts.count > 3 { s = "~/…/" + parts.suffix(2).joined(separator: "/") }
+        return s
+    }
+
+    private func openDetail(_ llm: DetectedLLMRuntime) {
+        // 只有真有东西可看才进详情，避免点进去一片空白
+        guard llm.hasQuota || !llm.platformDetail.rows.isEmpty || !llm.platformDetail.sessions.isEmpty else { return }
+        withAnimation(.easeInOut(duration: 0.15)) { drillDown = llm.name }
     }
 }

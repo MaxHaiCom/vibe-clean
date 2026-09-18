@@ -4,6 +4,19 @@ import ServiceManagement
 import UserNotifications
 import os
 
+/// 菜单项里的宿主视图：NSMenu 会把鼠标事件转发给菜单项的自定义视图，滚动事件也走这条路。
+/// 与 AppDelegate 里的本地监听器双路并行，谁先收到谁处理。
+final class SwipeHostingView<Content: View>: NSHostingView<Content> {
+    weak var delegateRef: AppDelegate?
+    private let vlog = Logger(subsystem: "com.haifeng.vibegauge", category: "menu")
+
+    override func scrollWheel(with event: NSEvent) {
+        vlog.debug("view scroll dx=\(event.scrollingDeltaX) dy=\(event.scrollingDeltaY)")
+        if delegateRef?.handleScroll(event) == true { return }
+        super.scrollWheel(with: event)
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var menu: NSMenu!
@@ -11,7 +24,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var autoCleanTimer: Timer?
 
     private var currentReport = ScanReport()
-    private weak var hostingView: NSHostingView<DashboardView>?
+    private weak var hostingView: SwipeHostingView<DashboardView>?
     private let log = Logger(subsystem: "com.haifeng.vibegauge", category: "menu")
 
     // UserDefaults Keys
@@ -84,6 +97,60 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }
+
+    // MARK: - 触控板左右滑动切 Tab
+    // NSMenu 打开后跑自己的事件循环（NSEventTrackingRunLoopMode），滚动事件不一定会派到菜单项里的视图，
+    // 所以用 app 级本地监听器：菜单开时装、关时卸，横向位移累计过阈值就切 Tab 并吞掉该事件。
+    private var scrollMonitor: Any?
+    private var swipeAccum: CGFloat = 0
+    private var lastSwipeAt: TimeInterval = 0
+    private static let tabCount = 3
+
+    private func installSwipeMonitor() {
+        guard scrollMonitor == nil else { return }
+        swipeAccum = 0
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
+            guard let self = self else { return event }
+            self.log.debug("monitor scroll dx=\(event.scrollingDeltaX) dy=\(event.scrollingDeltaY) precise=\(event.hasPreciseScrollingDeltas) phase=\(event.phase.rawValue)")
+            return self.handleScroll(event) ? nil : event
+        }
+    }
+
+    private func removeSwipeMonitor() {
+        if let m = scrollMonitor { NSEvent.removeMonitor(m) }
+        scrollMonitor = nil
+        swipeAccum = 0
+    }
+
+    /// 返回 true = 已处理（吞掉事件）
+    fileprivate func handleScroll(_ event: NSEvent) -> Bool {
+        var dx = event.scrollingDeltaX
+        let dy = event.scrollingDeltaY
+        if event.isDirectionInvertedFromDevice { dx = -dx }   // 用户关了「自然滚动」时方向要翻回来
+
+        if event.phase == .began || event.phase == .cancelled { swipeAccum = 0 }
+        guard abs(dx) > abs(dy) * 1.5 else { return false }   // 竖向为主 → 留给内容滚动
+        guard event.momentumPhase == [] else { return true }  // 惯性阶段只吞掉，不再切
+
+        swipeAccum += dx
+        let threshold: CGFloat = event.hasPreciseScrollingDeltas ? 45 : 3
+        let now = Date().timeIntervalSince1970
+        guard abs(swipeAccum) >= threshold, now - lastSwipeAt > 0.3 else { return true }
+
+        let step = swipeAccum < 0 ? 1 : -1                   // 向左滑 = 下一个 Tab（像翻页）
+        swipeAccum = 0
+        lastSwipeAt = now
+        let cur = UserDefaults.standard.integer(forKey: "vg.tab")
+        let next = max(0, min(Self.tabCount - 1, cur + step))
+        if next != cur {
+            UserDefaults.standard.set(next, forKey: "vg.tab")   // @AppStorage 会跟着刷新
+            log.debug("swipe tab \(cur) → \(next)")
+        }
+        return true
+    }
+
+    func menuWillOpen(_ menu: NSMenu) { installSwipeMonitor() }
+    func menuDidClose(_ menu: NSMenu) { removeSwipeMonitor() }
 
     private var isScanning = false
 
@@ -207,7 +274,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             actions: actions
         )
 
-        let hosting = NSHostingView(rootView: dashboard)
+        let hosting = SwipeHostingView(rootView: dashboard)
+        hosting.delegateRef = self
         hosting.frame = NSRect(origin: .zero, size: hosting.fittingSize)
         hostingView = hosting
 

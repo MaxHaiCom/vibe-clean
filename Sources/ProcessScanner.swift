@@ -105,6 +105,23 @@ public struct SubQuota: Identifiable {
     }
 }
 
+/// 一个活跃 CLI 会话（详情页列出来：在哪个目录、跑了多久）
+public struct SessionInfo: Identifiable {
+    public var id: Int { pid }
+    public let pid: Int
+    public let cwd: String
+    public let startedAgo: Int      // 秒
+    public let memMB: Double
+}
+
+/// 详情页用的补充信息：平台级的订阅/账号/来源字段（只放本地文件里真实存在的，邮箱类一律不取）
+public struct PlatformDetail {
+    public var rows: [(String, String)] = []        // 展示用键值对
+    public var sessions: [SessionInfo] = []
+    public var sourceFiles: [String] = []           // 数据来自哪些文件
+    public var extraPools: [(String, QuotaWindow)] = []   // 主卡没显示的桶（如 Codex Spark）
+}
+
 public struct DetectedLLMRuntime: Identifiable {
     public var id: String { name }
     public let name: String
@@ -122,6 +139,8 @@ public struct DetectedLLMRuntime: Identifiable {
     public var extraLine: String = ""
     /// 一个套餐带多个模型各自额度（如 OpenCode Zen）：卡内只显示用得最紧的 3 个，其余折叠
     public var subQuotas: [SubQuota] = []
+
+    public var platformDetail: PlatformDetail = PlatformDetail()
 
     public var hasQuota: Bool { fiveHour != nil || sevenDay != nil || secondaryFiveHour != nil || secondarySevenDay != nil }
 }
@@ -243,6 +262,16 @@ public enum Fmt {
         let h = m / 60
         if h < 24 { return "\(h)h\(m % 60)m" }
         return "\(h / 24)d\(h % 24)h"
+    }
+
+    private static let dateFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
+
+    public static func dateText(_ t: TimeInterval) -> String {
+        dateFmt.string(from: Date(timeIntervalSince1970: t))
     }
 
     /// 紧凑相对时间（卡片脚注用）："刚刚" / "12m前" / "16h前" / "3d前"
@@ -472,9 +501,44 @@ public final class ProcessScanner {
         let cmd: String
     }
 
+    /// 一批 pid 的 cwd（一次 lsof 拿完）
+    private func cwds(of pids: [Int]) -> [Int: String] {
+        guard !pids.isEmpty else { return [:] }
+        let out = execute("lsof -p \(pids.map(String.init).joined(separator: ",")) -a -d cwd -Fpn 2>/dev/null")
+        var map: [Int: String] = [:]
+        var cur = 0
+        for line in out.components(separatedBy: "\n") {
+            if line.hasPrefix("p") { cur = Int(line.dropFirst()) ?? 0 }
+            else if line.hasPrefix("n"), cur != 0 { map[cur] = String(line.dropFirst()) }
+        }
+        return map
+    }
+
+    /// 进程已运行秒数（ps etime）
+    private func ages(of pids: [Int]) -> [Int: Int] {
+        guard !pids.isEmpty else { return [:] }
+        let out = execute("ps -o pid=,etime= -p \(pids.map(String.init).joined(separator: ","))")
+        var map: [Int: Int] = [:]
+        for line in out.components(separatedBy: "\n") {
+            let f = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard f.count >= 2, let pid = Int(f[0]) else { continue }
+            // etime: [[dd-]hh:]mm:ss
+            var secs = 0
+            let main = f[1].split(separator: "-")
+            if main.count == 2 { secs += (Int(main[0]) ?? 0) * 86400 }
+            let parts = (main.last ?? "").split(separator: ":").map { Int($0) ?? 0 }
+            if parts.count == 3 { secs += parts[0] * 3600 + parts[1] * 60 + parts[2] }
+            else if parts.count == 2 { secs += parts[0] * 60 + parts[1] }
+            map[pid] = secs
+        }
+        return map
+    }
+
     private struct SessionCounts {
         var claude = 0, codex = 0, agy = 0, grok = 0
         var ollama = false, cursor = false, lmStudio = false
+        var pids: [CLIKind: [Int]] = [:]
+        var mem: [Int: Double] = [:]
     }
 
     private func readProcs() -> [Int: RawProc] {
@@ -521,6 +585,8 @@ public final class ProcessScanner {
                 hops += 1
             }
             if nested { continue }
+            c.pids[kind, default: []].append(pid)
+            c.mem[pid] = procs[pid]?.memMB ?? 0
             switch kind {
             case .claude: c.claude += 1
             case .codex: c.codex += 1
@@ -1060,6 +1126,107 @@ public final class ProcessScanner {
 
     // MARK: 平台汇聚
 
+    // 会话 cwd/启动时长要跑 lsof + ps，太贵，不能跟着每秒的 ticker 跑 → 10s 节流
+    private var sessionCache: [String: (at: TimeInterval, pids: [Int], infos: [SessionInfo])] = [:]
+
+    private func sessionInfos(_ c: SessionCounts, _ kind: CLIKind) -> [SessionInfo] {
+        let pids = (c.pids[kind] ?? []).sorted()
+        guard !pids.isEmpty else { return [] }
+        let key = "\(kind)"
+        let now = Date().timeIntervalSince1970
+        if let cached = sessionCache[key], cached.pids == pids, now - cached.at < 10 {
+            return cached.infos
+        }
+        let cw = cwds(of: pids)
+        let ag = ages(of: pids)
+        let infos = pids.map { SessionInfo(pid: $0, cwd: cw[$0] ?? "?", startedAgo: ag[$0] ?? 0, memMB: c.mem[$0] ?? 0) }
+            .sorted { $0.startedAgo > $1.startedAgo }
+        sessionCache[key] = (now, pids, infos)
+        return infos
+    }
+
+    private func claudeDetail(_ c: SessionCounts) -> PlatformDetail {
+        var d = PlatformDetail()
+        d.sourceFiles = ["~/.claude.json", "~/.claude/claude-usage.json", "~/.claude/projects/*.jsonl"]
+        if let oa = readJSON("\(home)/.claude.json")?["oauthAccount"] as? [String: Any] {
+            if let v = oa["organizationRateLimitTier"] as? String { d.rows.append(("限速档位字段", v)) }
+            if let v = oa["organizationType"] as? String { d.rows.append(("组织类型", v)) }
+            if let v = oa["billingType"] as? String { d.rows.append(("计费方式", v)) }
+            if let v = oa["organizationRole"] as? String { d.rows.append(("角色", v)) }
+            if let b = oa["hasExtraUsageEnabled"] as? Bool { d.rows.append(("额外用量", b ? "已开启" : "未开启")) }
+            if let v = oa["subscriptionCreatedAt"] as? String, let t = Fmt.parseISODate(v) {
+                d.rows.append(("订阅开始", Fmt.dateText(t) + "（\(Int((Date().timeIntervalSince1970 - t) / 86400)) 天前）"))
+            }
+        }
+        d.sessions = sessionInfos(c, .claude)
+        return d
+    }
+
+    private func codexDetail(_ c: SessionCounts, snapshot: CodexSnapshot, buckets: [String: CodexBucket]) -> PlatformDetail {
+        var d = PlatformDetail()
+        d.sourceFiles = ["~/.codex/auth.json", "~/.codex/sessions/*/*.jsonl"]
+        if let auth = readJSON("\(home)/.codex/auth.json"),
+           let idTok = (auth["tokens"] as? [String: Any])?["id_token"] as? String {
+            let segs = idTok.split(separator: ".")
+            if segs.count >= 2 {
+                var payload = String(segs[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+                let rem = payload.count % 4
+                if rem > 0 { payload += String(repeating: "=", count: 4 - rem) }
+                if let data = Data(base64Encoded: payload),
+                   let p = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let a = p["https://api.openai.com/auth"] as? [String: Any] {
+                    if let v = a["chatgpt_plan_type"] as? String { d.rows.append(("套餐字段", v)) }
+                    if let v = a["chatgpt_subscription_active_until"] as? String, let t = Fmt.parseISODate(v) {
+                        let left = Int((t - Date().timeIntervalSince1970) / 86400)
+                        d.rows.append(("订阅有效期至", Fmt.dateText(t) + "（还剩 \(left) 天）"))
+                    }
+                }
+            }
+            if let mode = auth["auth_mode"] as? String { d.rows.append(("鉴权方式", mode)) }
+        }
+        if !codexRemoteHost.isEmpty {
+            remoteLock.lock(); let ok = remoteCodex.ok; let at = remoteCodex.at; remoteLock.unlock()
+            d.rows.append(("远程合并主机", "\(codexRemoteHost) · " + (ok ? "已连上（\(Fmt.agoShort(Int(Date().timeIntervalSince1970 - at))) 拉取）" : "未连上")))
+        }
+        for (id, b) in buckets.sorted(by: { $0.key < $1.key }) where id != "codex" {
+            let label = b.name.isEmpty ? id : b.name
+            if let w = b.weekly { d.extraPools.append(("\(label) 周", w)) }
+            if let w = b.fiveHour { d.extraPools.append(("\(label) 5H", w)) }
+        }
+        d.sessions = sessionInfos(c, .codex)
+        return d
+    }
+
+    private func geminiDetail(_ c: SessionCounts) -> PlatformDetail {
+        var d = PlatformDetail()
+        d.sourceFiles = ["~/.gemini/antigravity-cli/", "~/.cache/agy-hud/quota_cache.json"]
+        if let st = readJSON("\(home)/.gemini/antigravity-cli/settings.json"), let m = st["model"] as? String {
+            d.rows.append(("默认模型", m))
+        }
+        if let tok = readJSON("\(home)/.gemini/antigravity-cli/antigravity-oauth-token"), let m = tok["auth_method"] as? String {
+            d.rows.append(("鉴权方式", m))
+        }
+        d.rows.append(("三方池说明", "只有跑 Claude/GPT 模型时才会刷新；耗尽后无法再刷，只能等重置"))
+        d.sessions = sessionInfos(c, .agy)
+        return d
+    }
+
+    private func grokDetail(_ c: SessionCounts) -> PlatformDetail {
+        var d = PlatformDetail()
+        d.sourceFiles = ["~/.grok/settings_cache.json", "~/.grok/logs/unified.jsonl"]
+        if let cache = readJSON("\(home)/.grok/settings_cache.json"),
+           let payloadStr = cache["payload"] as? String,
+           let pData = payloadStr.data(using: .utf8),
+           let pJson = try? JSONSerialization.jsonObject(with: pData) as? [String: Any],
+           let settings = pJson["settings"] as? [String: Any] {
+            if let v = settings["subscription_tier_display"] as? String { d.rows.append(("订阅档位（服务端原值）", v)) }
+            if let v = pJson["grok_version"] as? String { d.rows.append(("CLI 版本", v)) }
+        }
+        d.rows.append(("额度来源", "grok 自己的 billing 日志，不必产生对话就会刷"))
+        d.sessions = sessionInfos(c, .grok)
+        return d
+    }
+
     private func detectAllLLMRuntimes(_ c: SessionCounts) -> [DetectedLLMRuntime] {
         var list: [DetectedLLMRuntime] = []
         let fm = FileManager.default
@@ -1072,13 +1239,17 @@ public final class ProcessScanner {
                 fiveHour: q.fiveHour, sevenDay: q.sevenDay,
                 secondaryPoolName: q.extraName, secondaryFiveHour: q.extra5h, secondarySevenDay: q.extraW,
                 isFullWidth: !q.extraName.isEmpty,
-                quotaSubtitle: "Anthropic · 无额度数据 (状态栏未截获)"
+                quotaSubtitle: "Anthropic · 无额度数据 (状态栏未截获)",
+                platformDetail: claudeDetail(c)
             ))
         }
 
         // Codex（本机 + 远程合并；只显示主桶 codex）
         if c.codex > 0 || fm.fileExists(atPath: "\(home)/.codex/auth.json") {
             let q = codexSnapshot()
+            var allBuckets = readLocalCodex().buckets
+            remoteLock.lock(); let rb = remoteCodex.parsed.buckets; remoteLock.unlock()
+            for (k, v) in rb where v.captured > (allBuckets[k]?.captured ?? -1) { allBuckets[k] = v }
             let hasRemote = !codexRemoteHost.isEmpty
             list.append(DetectedLLMRuntime(
                 name: "Codex",
@@ -1086,7 +1257,8 @@ public final class ProcessScanner {
                 tier: getCodexTier(sessionPlan: q.plan),
                 detail: "\(c.codex) 会话",
                 fiveHour: q.primary?.fiveHour, sevenDay: q.primary?.weekly,
-                quotaSubtitle: (hasRemote && !q.remoteOK) ? "OpenAI · 无额度数据 (\(codexRemoteHost) 未连上)" : "OpenAI · 无额度数据 (近两日无 session)"
+                quotaSubtitle: (hasRemote && !q.remoteOK) ? "OpenAI · 无额度数据 (\(codexRemoteHost) 未连上)" : "OpenAI · 无额度数据 (近两日无 session)",
+                platformDetail: codexDetail(c, snapshot: q, buckets: allBuckets)
             ))
         }
 
@@ -1099,7 +1271,8 @@ public final class ProcessScanner {
                 fiveHour: q.native5h, sevenDay: q.nativeW,
                 secondaryPoolName: "三方", secondaryFiveHour: q.tp5h, secondarySevenDay: q.tpW,
                 isFullWidth: hasAny,
-                quotaSubtitle: "Antigravity · 无额度数据 (agy-hud 未刷新)"
+                quotaSubtitle: "Antigravity · 无额度数据 (agy-hud 未刷新)",
+                platformDetail: geminiDetail(c)
             ))
         }
 
@@ -1111,7 +1284,8 @@ public final class ProcessScanner {
             list.append(DetectedLLMRuntime(
                 name: "Grok", isRunning: c.grok > 0, tier: tier, detail: "\(c.grok) 会话",
                 sevenDay: q.weekly,
-                quotaSubtitle: "xAI · 无额度数据 (grok 未跑过)"
+                quotaSubtitle: "xAI · 无额度数据 (grok 未跑过)",
+                platformDetail: grokDetail(c)
             ))
         }
 
