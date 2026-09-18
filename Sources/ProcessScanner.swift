@@ -176,6 +176,9 @@ public struct APIProviderStatus: Identifiable {
     public var plan: String = ""
     public var fiveHour: QuotaWindow? = nil
     public var sevenDay: QuotaWindow? = nil
+    public var monthly: QuotaWindow? = nil
+    /// 额度是「本机记账的请求数 ÷ 套餐上限」估的（订阅制 Coding Plan 没有公开用量接口）
+    public var quotaIsEstimate: Bool = false
     public var balanceText: String = ""
     public var quotaError: String = ""
     public var cacheHitRate: Double { ctx > 0 ? Double(cacheRead) / Double(ctx) * 100.0 : 0.0 }
@@ -1731,6 +1734,47 @@ public final class ProcessScanner {
         }
     }
 
+    /// 订阅制 Coding Plan 的「请求数」上限（不是 token）。这类套餐没有公开用量接口，
+    /// 而且厂商明令禁止用非编程工具去调它的端点（会被判滥用、可能停用订阅），
+    /// 所以我们既不探测、也不猜价 —— 只拿本机记账的请求数 ÷ 上限估，并在面板上标明「估算」。
+    /// 上限从 ~/.config/vibegauge/plans.json 读（照官方套餐页自己填）。
+    public struct PlanLimit {
+        public var label: String = ""
+        public var five: Int = 0
+        public var weekly: Int = 0
+        public var monthly: Int = 0
+    }
+
+    private var planCache: (mtime: TimeInterval, plans: [String: PlanLimit])? = nil
+
+    private func planLimits() -> [String: PlanLimit] {
+        let path = "\(home)/.config/vibegauge/plans.json"
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let mod = attrs[.modificationDate] as? Date else { return [:] }
+        let mtime = mod.timeIntervalSince1970
+        if let c = planCache, c.mtime == mtime { return c.plans }
+        var out: [String: PlanLimit] = [:]
+        for (k, v) in readJSON(path) ?? [:] where !k.hasPrefix("_") {
+            guard let d = v as? [String: Any] else { continue }
+            let req = d["requests"] as? [String: Any] ?? [:]
+            func n(_ key: String) -> Int { (req[key] as? NSNumber)?.intValue ?? 0 }
+            var p = PlanLimit()
+            p.label = d["plan"] as? String ?? k
+            p.five = n("5h"); p.weekly = n("weekly"); p.monthly = n("monthly")
+            if p.five > 0 || p.weekly > 0 || p.monthly > 0 { out[k] = p }
+        }
+        planCache = (mtime, out)
+        return out
+    }
+
+    /// 滚动窗口内的请求数 → 额度窗口。重置点 = 窗口内最早那次调用 + 窗口长度（容量什么时候开始回来）
+    public static func rollingWindow(_ stamps: [TimeInterval], seconds: Double, limit: Int, now: TimeInterval) -> QuotaWindow? {
+        guard limit > 0 else { return nil }
+        let inWindow = stamps.filter { $0 >= now - seconds }
+        let pct = min(100, Int((Double(inWindow.count) / Double(limit) * 100).rounded()))
+        return QuotaWindow(usedPct: pct, resetsAt: inWindow.min().map { $0 + seconds }, capturedAt: now)
+    }
+
     private var priceCache: (mtime: TimeInterval, table: PriceTable)? = nil
 
     private func priceTable() -> PriceTable {
@@ -1762,7 +1806,8 @@ public final class ProcessScanner {
                        key: j["key"] as? String ?? "")
     }
 
-    /// api-calls.jsonl 也是 append-only：同样的 offset 增量 + 指纹识别重写；只保留 48h 内记录
+    /// api-calls.jsonl 也是 append-only：同样的 offset 增量 + 指纹识别重写；
+    /// 保留 31 天（Coding Plan 有"月"窗口要算；一条记录几十字节，18000 次/月也就一两 MB）
     private func ingestAPICalls() {
         let path = ProxyManager.shared.callsPath
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
@@ -1793,7 +1838,7 @@ public final class ProcessScanner {
         }
         apiFile.mtime = mtime
         apiFile.size = size
-        let horizon = Date().timeIntervalSince1970 - 48 * 3600
+        let horizon = Date().timeIntervalSince1970 - 31 * 86400
         if let first = apiCalls.first, first.ts < horizon { apiCalls.removeAll { $0.ts < horizon } }
     }
 
@@ -1870,6 +1915,22 @@ public final class ProcessScanner {
         for (host, keys) in byKey {
             byHost[host]?.keys = keys.values.sorted { $0.calls > $1.calls }
             byHost[host]?.costCurrency = prices.currency
+        }
+
+        // 订阅制 Coding Plan：厂商不给用量接口 → 按本机记账的请求数估。滚动窗口，标明是估算。
+        let plans = planLimits()
+        if !plans.isEmpty {
+            var stamps: [String: [TimeInterval]] = [:]       // provider → 各次调用时刻（31 天内）
+            for c in apiCalls { stamps[c.provider, default: []].append(c.ts) }
+            for (key, plan) in plans {
+                guard let host = byHost.first(where: { $0.value.provider == key || $0.key == key })?.key,
+                      let ts = stamps[byHost[host]!.provider] else { continue }
+                byHost[host]?.plan = plan.label
+                byHost[host]?.quotaIsEstimate = true
+                byHost[host]?.fiveHour = Self.rollingWindow(ts, seconds: 5 * 3600, limit: plan.five, now: now)
+                byHost[host]?.sevenDay = Self.rollingWindow(ts, seconds: 7 * 86400, limit: plan.weekly, now: now)
+                byHost[host]?.monthly = Self.rollingWindow(ts, seconds: 30 * 86400, limit: plan.monthly, now: now)
+            }
         }
         if let q = readJSON(pm.quotaPath) {
             for (host, v) in q {

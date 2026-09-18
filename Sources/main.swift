@@ -87,6 +87,17 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(ProcessScanner.PriceTable().isEmpty)
     }
 
+    // 订阅制 Coding Plan 的额度估算：滚动窗口内的请求数 ÷ 上限
+    do {
+        let stamps: [TimeInterval] = (0..<600).map { now - Double($0) * 10 }      // 最近 100 分钟里 600 次
+        let w = ProcessScanner.rollingWindow(stamps, seconds: 5 * 3600, limit: 1200, now: now)!
+        precondition(w.usedPct == 50, "600/1200 该是 50%，实际 \(w.usedPct)")
+        precondition(abs((w.resetsAt ?? 0) - (stamps.min()! + 5 * 3600)) < 1, "重置点 = 窗口内最早一次 + 窗口长")
+        let old = ProcessScanner.rollingWindow([now - 6 * 3600], seconds: 5 * 3600, limit: 1200, now: now)!
+        precondition(old.usedPct == 0, "窗口外的调用不该算")
+        precondition(ProcessScanner.rollingWindow(stamps, seconds: 3600, limit: 0, now: now) == nil, "没填上限就不估")
+    }
+
     let t0 = Date()
     let r = ProcessScanner.shared.scan()
     let t1 = Date()

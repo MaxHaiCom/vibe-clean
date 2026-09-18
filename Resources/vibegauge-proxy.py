@@ -55,7 +55,22 @@ _stats = {"calls": 0, "parsed": 0, "errors": 0}
 _hosts_seen: Dict[str, float] = {}
 
 
-def provider_of(host: str) -> str:
+# 额度类响应头（Anthropic 用 anthropic-ratelimit-*，OpenAI 用 x-ratelimit-*）。
+# 被动抓：厂商愿意在真实调用里给的额度，我们顺手记下来，绝不为了查额度去多发请求。
+def quota_headers(resp) -> Dict[str, str]:
+    out = {}
+    for k, v in resp.getheaders():
+        kl = k.lower()
+        if "ratelimit" in kl or "rate-limit" in kl or "quota" in kl:
+            out[kl] = v[:80]
+    return out
+
+
+def provider_of(host: str, path: str = "") -> str:
+    # 火山方舟 Coding Plan 与按量付费是两个 Base URL：/api/coding/* 才吃套餐额度，
+    # /api/v3/* 是后付费。分成两张卡，免得把两种账混在一起。
+    if "volces.com" in host.lower():
+        return "火山方舟 Coding" if path.startswith("/api/coding") else "火山豆包(按量)"
     h = host.lower()
     for sub, name in PROVIDERS:
         if sub in h:
@@ -261,7 +276,7 @@ class Handler(BaseHTTPRequestHandler):
         conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
         conn = conn_cls(hostport, timeout=600)
         rec: Dict[str, Any] = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z", "epoch": round(t0, 3),
-                               "host": hostport, "provider": provider_of(hostport), "path": redact_path(rest),
+                               "host": hostport, "provider": provider_of(hostport, rest), "path": redact_path(rest),
                                "model": req_model, "stream": stream, "key": key_fp}
         try:
             conn.request(self.command, rest, body=body, headers=hdrs)
@@ -324,6 +339,9 @@ class Handler(BaseHTTPRequestHandler):
                     "ctx": u.get("ctx", 0), "cache_read": u.get("cache_read", 0), "cache_write": u.get("cache_write", 0),
                     "out": u.get("out", 0), "think": u.get("think", 0), "parsed": bool(u.get("parsed")),
                     "bytes": len(buf)})
+        rl = quota_headers(resp)
+        if rl:
+            rec["rl"] = rl
         if not record:
             return
         with _lock:
