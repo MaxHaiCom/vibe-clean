@@ -666,6 +666,55 @@ public struct DashboardView: View {
                         .foregroundColor(.secondary)
                 }
 
+                // 今日按项目（工作目录）归因：token 花在哪个仓库上了
+                if !currentTokens.todayByProject.isEmpty {
+                    Divider().opacity(0.25)
+                    let projects = currentTokens.todayByProject
+                    let top = expandedCards.contains("__proj") ? Array(projects.prefix(8)) : Array(projects.prefix(3))
+                    let maxCtx = max(1, projects.first?.ctx ?? 1)
+                    VStack(alignment: .leading, spacing: 2.5) {
+                        HStack {
+                            Text("按项目")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            if projects.count > 3 {
+                                Button(action: {
+                                    if expandedCards.contains("__proj") { expandedCards.remove("__proj") } else { expandedCards.insert("__proj") }
+                                }) {
+                                    Text(expandedCards.contains("__proj") ? "收起" : "另 \(projects.count - 3) 个")
+                                        .font(.system(size: 7.5))
+                                        .foregroundColor(.blue)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        ForEach(top) { p in
+                            HStack(spacing: 4) {
+                                Text(p.name)
+                                    .font(.system(size: 8.5, weight: .medium))
+                                    .lineLimit(1)
+                                    .frame(width: 96, alignment: .leading)
+                                MiniProgressBar(value: Double(p.ctx) / Double(maxCtx), color: .blue.opacity(0.75), width: 46, height: 3.5)
+                                Text(formatTokens(p.ctx))
+                                    .font(.system(size: 8))
+                                    .foregroundColor(.secondary)
+                                    .fixedSize()
+                                Spacer(minLength: 2)
+                                Text(p.clis.joined(separator: "+"))
+                                    .font(.system(size: 7.5))
+                                    .foregroundColor(.secondary.opacity(0.8))
+                                    .fixedSize()
+                                Text("\(p.turns) 轮")
+                                    .font(.system(size: 7.5))
+                                    .foregroundColor(.secondary)
+                                    .fixedSize()
+                            }
+                            .help(p.path)
+                        }
+                    }
+                }
+
                 // 各 CLI 今日用量（各家日志能给多少给多少）
                 if !currentCLI.isEmpty {
                     Divider().opacity(0.25)

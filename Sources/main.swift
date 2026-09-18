@@ -270,6 +270,10 @@ if CommandLine.arguments.contains("--selftest") {
     for i in t.recentInteractions {
         print(String(format: "  %@ %@  ctx %d  out %d  think %d  hit %.1f%%  [%@]", Fmt.modelDisplayName(i.model), Fmt.ago(Int(now - i.timestamp)), i.contextTokens, i.outputTokens, i.thinkingTokens, i.cacheHitRate, i.id))
     }
+    print("--- 今日按项目归因 ---")
+    for p in t.todayByProject.prefix(8) {
+        print(String(format: "  %-28@ %5d 轮  ctx %-10lld out %-8lld  [%@]", p.name, p.turns, p.ctx, p.out, p.clis.joined(separator: "+")))
+    }
     print("--- 各 CLI 今日用量 ---")
     for u in r.cliUsage {
         if u.hasTokens {

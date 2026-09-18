@@ -44,6 +44,19 @@ public struct InteractionRecord: Identifiable, Equatable {
     }
 }
 
+/// 今日消耗按项目（工作目录）归因
+public struct ProjectUsage: Identifiable, Equatable {
+    public var id: String { path }
+    public let path: String
+    public var turns: Int = 0
+    public var ctx: Int64 = 0
+    public var out: Int64 = 0
+    public var think: Int64 = 0
+    public var clis: [String] = []          // 哪些 CLI 在这个目录里干过活
+    /// 末级目录名，面板上显示用
+    public var name: String { path.split(separator: "/").last.map(String.init) ?? path }
+}
+
 public struct TokenStats: Equatable {
     /// 最近 3 轮（跨所有会话，按时间倒序）
     public var recentInteractions: [InteractionRecord] = []
@@ -57,6 +70,9 @@ public struct TokenStats: Equatable {
     public var todayCacheHitRate: Double {
         todayContext > 0 ? Double(todayCacheRead) / Double(todayContext) * 100.0 : 0.0
     }
+
+    /// 今日按项目归因（按上下文 token 降序）
+    public var todayByProject: [ProjectUsage] = []
 }
 
 /// 某个 CLI 今日自己的用量（各家日志能给多少就给多少，给不了的说明原因）
@@ -551,6 +567,25 @@ public final class ProcessScanner {
         var turns: [String: InteractionRecord] = [:]
     }
     private var fileStates: [String: FileParseState] = [:]
+    /// 会话文件 → 工作目录。文件里写的 cwd 是权威值；目录名那种把 / 换成 - 的编码解不回来
+    /// （`vibe-gauge` 会被拆成 vibe/gauge），所以一律读文件。读到就缓存，不重复读盘。
+    private var fileCwdCache: [String: String] = [:]
+
+    private func sessionCwd(of path: String) -> String? {
+        if let c = fileCwdCache[path] { return c.isEmpty ? nil : c }
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        let head = String(decoding: (try? fh.read(upToCount: 16384)) ?? Data(), as: UTF8.self)
+        var found = ""
+        for line in head.split(separator: "\n").prefix(12) {
+            guard let data = line.data(using: .utf8),
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if let c = j["cwd"] as? String, !c.isEmpty { found = c; break }
+            if let p = j["payload"] as? [String: Any], let c = p["cwd"] as? String, !c.isEmpty { found = c; break }
+        }
+        fileCwdCache[path] = found
+        return found.isEmpty ? nil : found
+    }
     // 缓存：贵操作节流
     private var npxCache: (mb: Double, at: TimeInterval)? = nil
     private var ollamaCache: (count: Int, sub: String, at: TimeInterval)? = nil
@@ -1763,6 +1798,7 @@ public final class ProcessScanner {
         let horizon = now - 24.0 * 3600.0
         var seen = Set<String>()
         var byId: [String: InteractionRecord] = [:]   // 跨文件再去重（--fork-session 会把历史复制进新文件）
+        var idPath: [String: String] = [:]            // 这轮最终算在哪个文件上 → 用来归因到项目目录
         while let el = en.nextObject() as? String {
             guard el.hasSuffix(".jsonl") else { continue }
             let path = "\(projectsDir)/\(el)"
@@ -1775,6 +1811,7 @@ public final class ProcessScanner {
             for (id, rec) in refreshFileState(path: path, mtime: mtime, size: size).turns {
                 if let old = byId[id], old.timestamp >= rec.timestamp { continue }
                 byId[id] = rec
+                idPath[id] = path
             }
         }
         fileStates = fileStates.filter { seen.contains($0.key) }
@@ -1790,7 +1827,49 @@ public final class ProcessScanner {
             s.todayThinking += Int64(t.thinkingTokens)
         }
         s.recentInteractions = Array(all.sorted { $0.timestamp > $1.timestamp }.prefix(3))
+
+        // 按项目归因：Claude 这边用每轮所属文件的 cwd
+        var byProject: [String: ProjectUsage] = [:]
+        for (id, t) in byId where t.timestamp >= startOfToday {
+            guard let path = idPath[id], let cwd = sessionCwd(of: path) else { continue }
+            var p = byProject[cwd] ?? ProjectUsage(path: cwd)
+            p.turns += 1
+            p.ctx += Int64(t.contextTokens)
+            p.out += Int64(t.outputTokens)
+            p.think += Int64(t.thinkingTokens)
+            if !p.clis.contains("Claude") { p.clis.append("Claude") }
+            byProject[cwd] = p
+        }
+        mergeCodexProjects(into: &byProject, startOfToday: startOfToday)
+        s.todayByProject = byProject.values.sorted { $0.ctx > $1.ctx }
         return s
+    }
+
+    /// Codex 的今日用量按会话文件的 cwd 归并。口径与 codexUsageToday 一致：
+    /// `total_token_usage` 是**该会话累计**，每个文件取最后一条非空的再相加。
+    private func mergeCodexProjects(into byProject: inout [String: ProjectUsage], startOfToday: TimeInterval) {
+        let fm = FileManager.default
+        let df = DateFormatter()
+        df.dateFormat = "yyyy/MM/dd"
+        for back in 0...1 {
+            let dir = "\(home)/.codex/sessions/\(df.string(from: Date(timeIntervalSinceNow: -Double(back) * 86400)))"
+            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for n in names where n.hasSuffix(".jsonl") {
+                let path = "\(dir)/\(n)"
+                guard let attrs = try? fm.attributesOfItem(atPath: path),
+                      let mod = attrs[.modificationDate] as? Date,
+                      mod.timeIntervalSince1970 >= startOfToday,
+                      let cwd = sessionCwd(of: path),
+                      let u = codexFileUsage(path: path) else { continue }
+                var p = byProject[cwd] ?? ProjectUsage(path: cwd)
+                p.turns += u.requests
+                p.ctx += u.ctx
+                p.out += u.out
+                p.think += u.think
+                if !p.clis.contains("Codex") { p.clis.append("Codex") }
+                byProject[cwd] = p
+            }
+        }
     }
 
     // MARK: 各 CLI 今日用量
@@ -1815,29 +1894,7 @@ public final class ProcessScanner {
                 let mtime = mod.timeIntervalSince1970
                 guard mtime >= startOfToday else { continue }
                 seen.insert(path)
-                let one: CLIUsage
-                if let c = codexUsageCache[path], c.mtime == mtime {
-                    one = c.usage
-                } else {
-                    var acc = CLIUsage(name: "Codex")
-                    let text = readTail(path, maxBytes: 256 * 1024)
-                    let lines = text.components(separatedBy: "\n")
-                    for l in lines.reversed() where l.contains("\"type\":\"token_count\"") && !l.contains("\"info\":null") {
-                        guard let data = l.data(using: .utf8),
-                              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                              let info = findTokenInfo(json),
-                              let t = info["total_token_usage"] as? [String: Any] else { continue }
-                        func n64(_ k: String) -> Int64 { Int64((t[k] as? NSNumber)?.intValue ?? 0) }
-                        acc.ctx = n64("input_tokens")               // 已含 cached
-                        acc.cacheRead = n64("cached_input_tokens")
-                        acc.out = n64("output_tokens")
-                        acc.think = n64("reasoning_output_tokens")
-                        break
-                    }
-                    acc.requests = lines.filter { $0.contains("\"type\":\"token_count\"") && !$0.contains("\"info\":null") }.count
-                    one = acc
-                    codexUsageCache[path] = (mtime, acc)
-                }
+                guard let one = codexFileUsage(path: path, mtime: mtime) else { continue }
                 u.ctx += one.ctx
                 u.cacheRead += one.cacheRead
                 u.out += one.out
@@ -1848,6 +1905,32 @@ public final class ProcessScanner {
         codexUsageCache = codexUsageCache.filter { seen.contains($0.key) }
         if !u.hasTokens { u.note = "今日无调用" }
         return u
+    }
+
+    /// 单个 Codex 会话文件的累计用量（`total_token_usage` 是该会话累计 → 取最后一条非空的）。
+    /// 按 CLI 汇总与按项目归因共用这一份，口径不会分叉。
+    private func codexFileUsage(path: String, mtime: TimeInterval? = nil) -> CLIUsage? {
+        let mt = mtime ?? ((try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date)?.timeIntervalSince1970
+        guard let mt = mt else { return nil }
+        if let c = codexUsageCache[path], c.mtime == mt { return c.usage }
+        var acc = CLIUsage(name: "Codex")
+        let text = readTail(path, maxBytes: 256 * 1024)
+        let lines = text.components(separatedBy: "\n")
+        for l in lines.reversed() where l.contains("\"type\":\"token_count\"") && !l.contains("\"info\":null") {
+            guard let data = l.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let info = findTokenInfo(json),
+                  let t = info["total_token_usage"] as? [String: Any] else { continue }
+            func n64(_ k: String) -> Int64 { Int64((t[k] as? NSNumber)?.intValue ?? 0) }
+            acc.ctx = n64("input_tokens")               // 已含 cached
+            acc.cacheRead = n64("cached_input_tokens")
+            acc.out = n64("output_tokens")
+            acc.think = n64("reasoning_output_tokens")
+            break
+        }
+        acc.requests = lines.filter { $0.contains("\"type\":\"token_count\"") && !$0.contains("\"info\":null") }.count
+        codexUsageCache[path] = (mt, acc)
+        return acc
     }
 
     private func findTokenInfo(_ x: Any) -> [String: Any]? {
