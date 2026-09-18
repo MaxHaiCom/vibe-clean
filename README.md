@@ -35,7 +35,7 @@
 | 平台 | 什么时候写出新的额度数字 |
 |------|------------------------|
 | Claude | 每轮对话（Claude Code 状态栏每次渲染都带服务端下发的 `rate_limits`）→ 最快 |
-| Codex | **只在真的发出请求时**（会话 jsonl 的 `token_count` 事件）。开着 TUI 不产生任何额度记录 |
+| Codex | **只在真的发出请求时**（会话 jsonl 的 `token_count` 事件）。开着 TUI 不产生任何额度记录。额度打满后请求被拒，此时 `rate_limits` 的百分比全是 `null`，真信号在 `task_complete` 的 `usage_limit_exceeded` 错误里 → 本工具据此显示 100% 耗尽，重置时刻从错误文案（`try again at Sep 19th, 2026 5:03 PM`）解析 |
 | Gemini | agy 跑起来时由 agy-hud 刷 `quota_cache.json` |
 | Grok | grok 自己在跑时不定期拉一次 billing 配置，不必产生对话 |
 

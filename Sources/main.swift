@@ -43,6 +43,11 @@ if CommandLine.arguments.contains("--selftest") {
     precondition(!ProcessScanner.isCodexCLISession(cmd: "/Users/x/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path/rg"))
     precondition(!ProcessScanner.isCodexCLISession(cmd: "ssh host codex mcp-server"))
 
+    // Codex 额度耗尽文案里的重置时刻
+    precondition(Fmt.parseUsageLimitReset("You've hit your usage limit. Visit https://x to purchase more credits or try again at Sep 19th, 2026 5:03 PM.") != nil)
+    precondition(Fmt.parseUsageLimitReset("try again at Oct 1st, 2026 12:00 AM") != nil)
+    precondition(Fmt.parseUsageLimitReset("no reset info here") == nil)
+
     let t0 = Date()
     let r = ProcessScanner.shared.scan()
     let t1 = Date()

@@ -215,6 +215,25 @@ public enum Fmt {
         return "\(secs / 86400)d前"
     }
 
+    private static let usageResetFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "MMM d, yyyy h:mm a"
+        return f
+    }()
+
+    /// Codex 额度耗尽文案里的重置时间："...try again at Sep 19th, 2026 5:03 PM." → epoch（按本机时区）
+    public static func parseUsageLimitReset(_ message: String) -> TimeInterval? {
+        guard let re = try? NSRegularExpression(pattern: #"try again (?:at|on)\s+([A-Za-z]{3,})\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})[,\s]+(\d{1,2}):(\d{2})\s*([AaPp])\.?[Mm]"#) else { return nil }
+        let ns = message as NSString
+        guard let m = re.firstMatch(in: message, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        func g(_ i: Int) -> String { ns.substring(with: m.range(at: i)) }
+        let month = String(g(1).prefix(3))
+        let text = "\(month) \(g(2)), \(g(3)) \(g(4)):\(g(5)) \(g(6).uppercased())M"
+        usageResetFormatter.timeZone = TimeZone.current
+        return usageResetFormatter.date(from: text)?.timeIntervalSince1970
+    }
+
     /// 相对时间："刚刚" / "35秒前" / "12分钟前" / "3小时前"
     public static func ago(_ secs: Int) -> String {
         if secs < 8 { return "刚刚" }
@@ -721,10 +740,20 @@ public final class ProcessScanner {
         var plan: String
         var captured: TimeInterval
     }
-    private var codexFileCache: [String: (mtime: TimeInterval, buckets: [String: CodexBucket])] = [:]
+    /// 额度打满：请求被拒时 Codex 写 rate_limits 但百分比全为 null，真信号在 task_complete 的
+    /// error.codex_error_info == "usage_limit_exceeded"，重置时刻在 error.message 文案里。
+    private struct CodexLimitHit {
+        var at: TimeInterval
+        var resetsAt: TimeInterval?
+    }
+    private struct CodexParse {
+        var buckets: [String: CodexBucket] = [:]
+        var limitHit: CodexLimitHit? = nil
+    }
+    private var codexFileCache: [String: (mtime: TimeInterval, parsed: CodexParse)] = [:]
 
     private let remoteLock = NSLock()
-    private var remoteCodex: (at: TimeInterval, ok: Bool, buckets: [String: CodexBucket]) = (0, false, [:])
+    private var remoteCodex: (at: TimeInterval, ok: Bool, parsed: CodexParse) = (0, false, CodexParse())
     /// 另一台真正跑 Codex 的机器（默认空 = 关闭远程合并）。
     /// 开启：`defaults write com.haifeng.vibeclean codexRemoteHost <ssh-host>`，该 host 需能免密 ssh。
     public var codexRemoteHost: String {
@@ -743,35 +772,57 @@ public final class ProcessScanner {
         return nil
     }
 
-    /// 每个 limit_id 取采集时间最新的一条。不能靠行序：远程输出是多文件拼接、顺序随机；半行/坏行直接跳过。
-    private func parseCodexBuckets(_ text: String, fallbackTime: TimeInterval) -> [String: CodexBucket] {
-        var out: [String: CodexBucket] = [:]
-        for l in text.components(separatedBy: "\n") where l.contains("used_percent") {
-            guard let data = l.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let rl = findRateLimits(json) else { continue }
+    /// 每个 limit_id 取采集时间最新的一条，并抓最新的"额度耗尽"事件。
+    /// 不能靠行序：远程输出是多文件拼接、顺序随机；半行/坏行直接跳过。
+    private func parseCodexText(_ text: String, fallbackTime: TimeInterval) -> CodexParse {
+        var out = CodexParse()
+        for l in text.components(separatedBy: "\n") {
+            let hasPct = l.contains("used_percent")
+            let hasHit = l.contains("usage_limit_exceeded")
+            guard hasPct || hasHit,
+                  let data = l.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            let ts = parseISO(json["timestamp"] as? String) ?? fallbackTime
+
+            if hasHit, let msg = findErrorMessage(json) {
+                if ts > (out.limitHit?.at ?? -1) {
+                    out.limitHit = CodexLimitHit(at: ts, resetsAt: Fmt.parseUsageLimitReset(msg))
+                }
+            }
+
+            guard hasPct, let rl = findRateLimits(json) else { continue }
             let rawId = rl["limit_id"] as? String ?? ""
             let id = rawId.isEmpty ? "codex" : rawId
-            let captured = parseISO(json["timestamp"] as? String) ?? fallbackTime
-            if captured <= (out[id]?.captured ?? -1) { continue }
+            if ts <= (out.buckets[id]?.captured ?? -1) { continue }
             var b = CodexBucket(id: id, name: rl["limit_name"] as? String ?? "", fiveHour: nil, weekly: nil,
-                                plan: rl["plan_type"] as? String ?? "", captured: captured)
+                                plan: rl["plan_type"] as? String ?? "", captured: ts)
             for key in ["primary", "secondary"] {
                 guard let w = rl[key] as? [String: Any], let used = clampPct(w["used_percent"] as? NSNumber) else { continue }
-                let win = QuotaWindow(usedPct: used, resetsAt: (w["resets_at"] as? NSNumber)?.doubleValue, capturedAt: captured)
+                let win = QuotaWindow(usedPct: used, resetsAt: (w["resets_at"] as? NSNumber)?.doubleValue, capturedAt: ts)
                 if ((w["window_minutes"] as? NSNumber)?.intValue ?? 0) >= 1440 { b.weekly = win } else { b.fiveHour = win }
             }
-            out[id] = b
+            // 百分比全 null（请求被拒时就是这样）→ 不是有效快照，别覆盖旧的真值
+            if b.fiveHour != nil || b.weekly != nil { out.buckets[id] = b }
         }
         return out
     }
 
-    private func mergeNewest(_ into: inout [String: CodexBucket], _ src: [String: CodexBucket]) {
-        for (id, b) in src where b.captured > (into[id]?.captured ?? -1) { into[id] = b }
+    private func findErrorMessage(_ x: Any) -> String? {
+        guard let d = x as? [String: Any] else { return nil }
+        if let e = d["error"] as? [String: Any] {
+            if (e["codex_error_info"] as? String) == "usage_limit_exceeded", let m = e["message"] as? String { return m }
+        }
+        for v in d.values { if let r = findErrorMessage(v) { return r } }
+        return nil
+    }
+
+    private func mergeNewest(_ into: inout CodexParse, _ src: CodexParse) {
+        for (id, b) in src.buckets where b.captured > (into.buckets[id]?.captured ?? -1) { into.buckets[id] = b }
+        if let h = src.limitHit, h.at > (into.limitHit?.at ?? -1) { into.limitHit = h }
     }
 
     /// 本机：近 7 天目录里 48h 内改过的会话文件，各取每桶最新；单文件按 mtime 缓存
-    private func readLocalCodexBuckets() -> [String: CodexBucket] {
+    private func readLocalCodex() -> CodexParse {
         let fm = FileManager.default
         let now = Date().timeIntervalSince1970
         let df = DateFormatter()
@@ -788,24 +839,24 @@ public final class ProcessScanner {
                 }
             }
         }
-        var merged: [String: CodexBucket] = [:]
+        var merged = CodexParse()
         var seen = Set<String>()
         for f in files {
             seen.insert(f.path)
-            let buckets: [String: CodexBucket]
+            let parsed: CodexParse
             if let c = codexFileCache[f.path], c.mtime == f.mtime {
-                buckets = c.buckets
+                parsed = c.parsed
             } else {
                 let tailBytes = 256 * 1024
                 let tail = readTail(f.path, maxBytes: tailBytes)
-                var b = parseCodexBuckets(tail, fallbackTime: f.mtime)
-                if b.isEmpty, tail.utf8.count >= tailBytes {          // 尾部没有就全量
-                    b = parseCodexBuckets(readTail(f.path, maxBytes: Int.max), fallbackTime: f.mtime)
+                var pr = parseCodexText(tail, fallbackTime: f.mtime)
+                if pr.buckets.isEmpty, pr.limitHit == nil, tail.utf8.count >= tailBytes {   // 尾部没有就全量
+                    pr = parseCodexText(readTail(f.path, maxBytes: Int.max), fallbackTime: f.mtime)
                 }
-                buckets = b
-                codexFileCache[f.path] = (f.mtime, b)
+                parsed = pr
+                codexFileCache[f.path] = (f.mtime, pr)
             }
-            mergeNewest(&merged, buckets)
+            mergeNewest(&merged, parsed)
         }
         codexFileCache = codexFileCache.filter { seen.contains($0.key) }
         return merged
@@ -821,14 +872,15 @@ public final class ProcessScanner {
         let due = force || now - remoteCodex.at >= 60
         remoteLock.unlock()
         guard due else { return }
-        let script = #"for f in $(find ~/.codex/sessions -name "*.jsonl" -mmin -2880 2>/dev/null); do tail -c 262144 "$f" | grep used_percent | tail -1; done; echo __OK__"#
+        // 每个文件取：最后一条含百分比的行 + 最后一条额度耗尽事件
+        let script = #"for f in $(find ~/.codex/sessions -name "*.jsonl" -mmin -2880 2>/dev/null); do tail -c 262144 "$f" | grep used_percent | tail -1; tail -c 262144 "$f" | grep usage_limit_exceeded | tail -1; done; echo __OK__"#
         let out = execute("ssh -o BatchMode=yes -o ConnectTimeout=4 -o ServerAliveInterval=5 \(host) '\(script)' 2>/dev/null")
         let ok = out.contains("__OK__")
-        let buckets = ok ? parseCodexBuckets(out, fallbackTime: now) : [:]
+        let parsed = ok ? parseCodexText(out, fallbackTime: now) : CodexParse()
         remoteLock.lock()
-        remoteCodex = ok ? (now, true, buckets) : (now, false, remoteCodex.buckets)
+        remoteCodex = ok ? (now, true, parsed) : (now, false, remoteCodex.parsed)
         remoteLock.unlock()
-        log.notice("remote codex \(host, privacy: .public) ok=\(ok) buckets=\(buckets.count)")
+        log.notice("remote codex \(host, privacy: .public) ok=\(ok) buckets=\(parsed.buckets.count) limitHit=\(parsed.limitHit != nil)")
     }
 
     private struct CodexSnapshot {
@@ -839,13 +891,29 @@ public final class ProcessScanner {
 
     /// 只展示主桶 "codex"；其他桶（如 codex_bengalfox / Spark）解析出来只为了不被误当主桶，不显示
     private func codexSnapshot() -> CodexSnapshot {
-        var merged = readLocalCodexBuckets()
+        var merged = readLocalCodex()
         remoteLock.lock()
         let remote = remoteCodex
         remoteLock.unlock()
-        mergeNewest(&merged, remote.buckets)
-        let plan = merged.values.sorted { $0.captured > $1.captured }.first { !$0.plan.isEmpty }?.plan ?? ""
-        return CodexSnapshot(primary: merged["codex"], plan: plan, remoteOK: remote.ok)
+        mergeNewest(&merged, remote.parsed)
+        let plan = merged.buckets.values.sorted { $0.captured > $1.captured }.first { !$0.plan.isEmpty }?.plan ?? ""
+        var primary = merged.buckets["codex"]
+
+        // 额度耗尽事件比最后一个百分比快照更新 → 真值就是 100%，重置时刻取错误文案里的时间
+        if let hit = merged.limitHit, hit.at > (primary?.weekly?.capturedAt ?? -1) {
+            let now = Date().timeIntervalSince1970
+            let stillHit = (hit.resetsAt ?? .greatestFiniteMagnitude) > now
+            if stillHit {
+                let win = QuotaWindow(usedPct: 100, resetsAt: hit.resetsAt ?? primary?.weekly?.resetsAt, capturedAt: hit.at)
+                if primary == nil {
+                    primary = CodexBucket(id: "codex", name: "", fiveHour: nil, weekly: win, plan: plan, captured: hit.at)
+                } else {
+                    primary?.weekly = win
+                    primary?.captured = hit.at
+                }
+            }
+        }
+        return CodexSnapshot(primary: primary, plan: plan, remoteOK: remote.ok)
     }
 
     /// Grok：grok CLI 自己在 ~/.grok/logs/unified.jsonl 记 "billing: fetched credits config"
