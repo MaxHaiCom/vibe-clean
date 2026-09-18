@@ -1,0 +1,39 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: macos-14
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Compile and Bundle App
+      run: |
+        chmod +x ./build.sh
+        ./build.sh
+        # Run selftest to ensure clean binary
+        ./VibeGauge.app/Contents/MacOS/VibeGauge --selftest
+
+    - name: Package Zip
+      run: |
+        # Use ditto to preserve macOS metadata and code signatures
+        ditto -c -k --sequesterRsrc --keepParent VibeGauge.app VibeGauge.zip
+        shasum -a 256 VibeGauge.zip > VibeGauge.zip.sha256
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          VibeGauge.zip
+          VibeGauge.zip.sha256
+        draft: false
+        prerelease: false
+        generate_release_notes: true

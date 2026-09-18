@@ -1,0 +1,16 @@
+name: "Feature / Provider Request"
+description: "Suggest a new AI CLI, model provider, or feature for VibeGauge"
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: feature-description
+    attributes:
+      label: Description of Feature or Provider
+      description: What CLI, model provider, or functionality would you like to see supported?
+    validations:
+      required: true
+  - type: textarea
+    id: data-source
+    attributes:
+      label: Local Log / Cache Location (If applicable)
+      description: Where does the CLI store its local session logs, tokens, or quota cache? (e.g. ~/.mycli/config.json)

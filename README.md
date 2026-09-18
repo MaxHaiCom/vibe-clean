@@ -1,111 +1,189 @@
 # VibeGauge 🧠
 
-专为 **Vibe Coding** 打造的极简 macOS 菜单栏原生监控与清理工具（纯 Swift + AppKit + SwiftUI，无第三方依赖）。
+<p align="center">
+  <img src="Resources/AppIcon_1024.png" width="100" height="100" alt="VibeGauge Icon" />
+</p>
 
-> 解决频繁使用 Claude Code、Codex、Antigravity（agy）、Grok CLI 时，死掉的 MCP 进程越积越多把内存吃光的问题；顺带把各家订阅档位、额度窗口、Token 消耗、API Key 调用放到同一块面板上。
+<h3 align="center">The Native macOS Menu Bar Dashboard for Vibe Coders</h3>
 
-**English**: A tiny native macOS menu-bar monitor for AI coding workflows. It reaps orphaned MCP processes that leak memory, and shows — in one panel — subscription tiers with 5h/weekly quota windows for Claude Code, Codex, Gemini (Antigravity) and Grok, today's token usage with prompt-cache hit rate, and per-provider API-key usage captured by a built-in local accounting proxy (Chinese providers and coding plans included: GLM, Doubao, MiMo, Kimi, MiniMax, DeepSeek, OpenRouter…). Everything is read from local CLI session logs or the vendors' own usage endpoints; nothing is uploaded anywhere. macOS 14+, no dependencies beyond the system Swift toolchain and `/usr/bin/python3`.
+<p align="center">
+  <b>Reap orphaned MCP zombie processes · Monitor AI quotas & 5h/weekly reset countdowns · Track Token costs & Prompt Cache hit rates in real time.</b>
+</p>
 
----
+<p align="center">
+  <a href="https://github.com/MaxHaiCom/vibe-gauge/releases"><img src="https://img.shields.io/github/v/release/MaxHaiCom/vibe-gauge?style=flat-square&color=blue" alt="Release"></a>
+  <img src="https://img.shields.io/badge/Platform-macOS%2014%2B-lightgrey?style=flat-square&logo=apple" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/Language-Swift%20%2F%20SwiftUI-orange?style=flat-square&logo=swift" alt="Swift Native">
+  <img src="https://img.shields.io/badge/Dependencies-Zero%20(Pure%20Native)-success?style=flat-square" alt="Zero Dependencies">
+  <img src="https://img.shields.io/badge/Privacy-100%25%20Local-blueviolet?style=flat-square" alt="100% Local">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License"></a>
+</p>
 
-## 面板内容
-
-菜单 = 一块面板 + 「退出」。面板顶部三个 Tab（记住上次选择），高度随当前 Tab 内容自适应（超过屏幕可用高度才滚动），右上角 ⟳ 重新扫描：
-
-1. **订阅**：每个平台一张卡片 —— 在线状态 · 订阅档位 · 活跃会话数 · 5H/周额度进度条 · 重置倒计时 · 数据新鲜度；今日（本地日历日）调用次数、上下文总量、Prompt Cache 命中率、输出/思考 Token；最近 3 轮交互实时滚动。一个套餐带多个模型额度时，卡内只列用得最紧的 3 个，其余折叠。
-   今日用量下面**按 CLI 分列**，各家日志能给多少就给多少：**Claude Code** 完整；**Codex** 用会话 jsonl 的 `token_count.info.total_token_usage`（该字段是会话累计值 → 每个会话文件取最后一条非空的再跨文件相加，`info` 为 null 的被额度拒的请求不计；跨零点的会话会把前一天那部分算进来，Codex 不按天分账）；**Grok** 的 `signals.json` 只有 `turnCount`、没有累计 token → 只报轮次；**Gemini**（Antigravity）会话是 SQLite 且无 token 字段 → 只能看额度。
-2. **API**：经记账代理的每个上游一张卡（见下文"API Key 调用记账"）；底部装/卸代理、复制前缀。
-3. **系统**：顶部清理按钮（一键回收断链孤儿 MCP：`PPID == 1` + 无监听端口 + 非白名单 + node/python 运行器 + MCP 签名；清空 `~/.npm/_npx`）；内存可用率（`memory_pressure`）、压缩池、Swap、磁盘剩余、CPU 负载、发热、活跃 MCP 进程与内存、NPX 缓存、断链孤儿明细；设置开关：每 30 分钟静默巡检、登录自启。
-
-菜单栏图标：芯片框内嵌内存可用百分比，随内存变化实时刷新。
-
----
-
-## 数据来源（档位与额度全部只读本地文件，查不到就标"无数据"，不猜）
-
-| 平台 | 档位 | 额度 | 新鲜度 |
-|------|------|------|--------|
-| Claude | `~/.claude.json` → `oauthAccount.organizationRateLimitTier`（`default_claude_max_5x` → Max 5x / `max_20x` → Max 20x / pro / team） | `~/.claude/claude-usage.json`（statusline 截获 Claude Code 下发的整个 `rate_limits`：`five_hour` / `seven_day` 的 `used_percentage` + `resets_at`）。Claude Code 目前**不下发按模型的窗口**（无 Fable/Opus 独立桶）；若将来出现如 `seven_day_fable` 键，自动当副池显示 | `_captured_at` |
-| Codex | `~/.codex/auth.json` id_token JWT → `chatgpt_plan_type`（`prolite` → Pro Lite / plus / pro / team） | 会话 jsonl 的 `rate_limits` **按 `limit_id` 分桶**：只显示主桶 `codex`（新版 CLI 另报的 `codex_bengalfox`/Spark 等桶解析但不显示，免得被误当主桶）→ 取采集时间最新的一条。来源 = 本机 `~/.codex/sessions`（近 7 天目录、48h 内改过）**+ 可选远程主机 ssh 拉取**（默认关闭；`defaults write com.haifeng.vibegauge codexRemoteHost <ssh-host>` 开启，60s 一次，需免密 ssh），两边按采集时间合并 | 该行 `timestamp` |
-| Gemini（Antigravity） | 本地没有套餐字段；新版 agy 连 token 文件也不落盘 → 有 token 文件显示鉴权方式，否则能拉到额度即 "已登录" | `~/.cache/agy-hud/quota_cache.json`（`gemini` 池 + `3p` 三方池，`remaining_fraction` + `reset_at`） | 每个池各自的 `recorded_at`，脚注分别标 |
-| Grok | `~/.grok/settings_cache.json` → `subscription_tier_display` 原值 | `~/.grok/logs/unified.jsonl` 最后一条 `billing: fetched credits config`（`creditUsagePercent` = 周额度已用 %，`currentPeriod.end` = 重置点；grok 跑着时每几分钟记一次） | 该行 `ts` |
-| Ollama / LM Studio / Cursor | 只探测进程在线 | 无 | — |
-
-各家额度的**更新时机**（都不是本工具能控制的，没有不花额度的查询接口）：
-
-| 平台 | 什么时候写出新的额度数字 |
-|------|------------------------|
-| Claude | 每轮对话（Claude Code 状态栏每次渲染都带服务端下发的 `rate_limits`）→ 最快 |
-| Codex | **只在真的发出请求时**（会话 jsonl 的 `token_count` 事件）。开着 TUI 不产生任何额度记录。额度打满后请求被拒，此时 `rate_limits` 的百分比全是 `null`，真信号在 `task_complete` 的 `usage_limit_exceeded` 错误里 → 本工具据此显示 100% 耗尽，重置时刻从错误文案（`try again at Sep 19th, 2026 5:03 PM`）解析 |
-| Gemini | agy 跑起来时由 agy-hud 刷 `quota_cache.json` |
-| Grok | grok 自己在跑时不定期拉一次 billing 配置，不必产生对话 |
-
-所以卡片脚注的"记录于 Nh前"是**数据源的年龄**，不是本工具没刷新。
-
-额度规则：
-- 已过 `resets_at` 的缓存值视为 **0%**（"已重置"），不再显示过期高值。
-- 采集时间超过 5 分钟 → 卡片脚注橙色标出"记录于 Nh前"（主池、副池分别标）。Claude 额度只在 Claude Code 状态栏渲染时更新，Codex 额度只在某台机器的 Codex 会话产生 token 事件时更新，这两处"旧"是数据源本身的限制。
-
-Token 统计规则：
-- Claude Code 的 jsonl 里同一个 `requestId` 会写多行（每个 content block 一行），`usage` 相同 → **按 requestId 去重**后才算一次调用。
-- "今日" 按每条记录的 `timestamp` 归本地日历日，不按文件 mtime。
-- jsonl 为 append-only：只增量解析新增字节（记 offset），菜单打开时每秒刷新一次只需约 100ms。
+<p align="center">
+  <b>🇺🇸 English</b> •
+  <a href="README_zh.md">🇨🇳 简体中文</a>
+</p>
 
 ---
 
-## API Key 调用记账（国内外 API / coding plan）
+<p align="center">
+  <img src="assets/dashboard_subscription.png" width="48%" alt="Subscription & Quota Dashboard" />
+  &nbsp;
+  <img src="assets/dashboard_system.png" width="48%" alt="System & MCP Process Cleaner" />
+</p>
 
-CLI 会话日志只覆盖 Claude Code / Codex / agy / grok 自己的调用。任何程序拿 **API key** 直接打 API（Claude Code 接国内模型、脚本、Hermes…）要看到模型 / 上下文 / token，走内置的**记账代理**：
+---
 
-- 代理 = `Resources/vibegauge-proxy.py`（纯 stdlib Python，`/usr/bin/python3` 即可，零依赖）。菜单「安装 API 记账代理」→ 拷到 `~/.config/vibegauge/`，注册 LaunchAgent `com.haifeng.vibegauge.proxy`（登录自启、崩溃自拉，不依赖 VibeGauge 存活），监听 `127.0.0.1:18790`。命令行等价：`VibeGauge --install-proxy` / `--uninstall-proxy`。
-- **零配置**：上游写在路径里。别名里的 BASE_URL 前面加代理前缀即可：
-  ```bash
-  ANTHROPIC_BASE_URL=http://127.0.0.1:18790/https://open.bigmodel.cn/api/anthropic   # GLM
-  OPENAI_BASE_URL=http://127.0.0.1:18790/https://api.deepseek.com/v1                 # DeepSeek
-  # 一键给 ~/.zshrc 里所有 ANTHROPIC_BASE_URL 加前缀（幂等，备份 .bak）：
-  perl -pi.bak -e 's#(ANTHROPIC_BASE_URL=["\x27]?)(?!http://127\.0\.0\.1:18790/)(https?://)#$1http://127.0.0.1:18790/$2#' ~/.zshrc
-  ```
-  订阅版 Claude Code（`cc`，无 BASE_URL）不要走它——它的用量已在会话日志里，而且它用 HTTPS_PROXY 出网，代理不转发这个环境变量。
-- **记账**：每次 POST 一行 `~/.config/vibegauge/api-calls.jsonl`（`ts/host/provider/model/ctx/cache_read/cache_write/out/think/status/ms`）。**不落 key**：只记 key 的 SHA-256 前 8 位指纹用于区分多个 key，请求路径的 query string 一律抹掉（Gemini 那种 `?key=` 在 URL 里的写法不会进文件）。流式也解析：Anthropic `message_start`+`message_delta`、OpenAI 最后一个带 `usage` 的 chunk、Gemini `usageMetadata`、Ollama 原生。响应原样流式透传，客户端无感。
-- **额度 / 余额**：代理从请求头看到各上游的 key（只在内存，不落盘），每 5 分钟查一次厂商用量接口，写 `api-quota.json`：
+## 💡 Why VibeGauge?
 
-  | 厂商 | 接口 | 状态 |
-  |------|------|------|
-  | GLM Coding Plan | `GET open.bigmodel.cn/api/monitor/usage/quota/limit`（5h + 周，`level` 档位） | 实测存在；无套餐时返回"当前用户不存在coding plan" |
-  | OpenRouter | `/api/v1/auth/key` + `/api/v1/credits`（余额 = credits − usage） | 实测通 |
-  | DeepSeek | `/user/balance` | 官方文档 |
-  | Kimi 按量 | `api.moonshot.cn/v1/users/me/balance` | 官方文档 |
-  | Kimi Code 订阅 | `api.kimi.com/coding/v1/usages` | 社区接口，未实测 |
-  | MiniMax Token Plan | `api.minimaxi.com/v1/token_plan/remains` | 社区接口，未实测 |
-  | 火山方舟 coding / 小米 MiMo / xAI 推理 key | 无公开接口（实测 404 / 需云账号 AK/SK 或管理 key） | 只记调用 |
+When using autonomous coding agents like **Claude Code**, **OpenAI Codex**, **Google Antigravity (agy)**, or **Grok CLI**, developers encounter three recurring frustrations:
 
-- 面板「API Key 调用」：每个上游一张卡，档位显示套餐（如 `Coding Lite`）或 `API Key`，5H/W 额度条或余额，今日调用次数 + 模型 + 上下文/输出/缓存命中。
-- 自测：`/usr/bin/python3 Resources/vibegauge-proxy.py --selftest`（本地假上游，验证流式/非流式解析）。
+1. **🧟‍♂️ Memory Leaks from Orphaned MCP Servers**:
+   Every time an agent spins up or aborts, headless `node` or `python` Model Context Protocol (MCP) server processes are left behind (`PPID == 1`). Over days of coding, dozens or hundreds of these zombie processes quietly hoard **5 GB to 10 GB of RAM**, triggering heavy swap and system thermal throttling.
+2. **⏳ Quota Blind Spots & "Reset Anxiety"**:
+   Each vendor uses a different quota model — Claude's dynamic 5-hour rolling window and 7-day limits, Codex's weekly quotas, Gemini's credit pools. Wondering if your quota has reset or when you can code again usually requires hitting rate limits in the terminal or opening vendor dashboards.
+3. **📊 Token Costs & Prompt Cache Black Hole**:
+   How many tokens did you burn today? Is Prompt Caching actually hitting 95%+ to save your budget? How much thinking/reasoning token overhead was generated?
 
-## 编译与启动
+**VibeGauge** is built entirely with native **Swift + AppKit + SwiftUI**. It is lightweight (~15MB RAM), has **zero third-party dependencies, zero cloud uploads, and performs 100% local, read-only inspection**.
+
+---
+
+## ✨ Features
+
+- 🧹 **One-Click Orphaned MCP Reaper**:
+  - Automatically identifies headless MCP servers (`PPID == 1`, no listening ports, not on system whitelist, matches MCP signatures).
+  - Multi-tier safety guards prevent accidental kills of legitimate dev tasks.
+  - One-click clearing of `~/.npm/_npx` cache bloat.
+  - Optional silent background sweep every 30 minutes.
+- ⏱️ **Unified AI Quota & Reset Timers**:
+  - **Claude**: Captures subscription tier (Max 5x / Max 20x / Pro / Team), 5-hour percentage, 7-day quota, and exact countdown to reset.
+  - **Codex**: Detects primary `codex` bucket usage, identifies `usage_limit_exceeded` exact unlock timestamps, and supports optional passwordless SSH synchronization from remote dev machines.
+  - **Gemini / Antigravity**: Tracks official and 3rd-party quota pools with respective reset dates.
+  - **Grok**: Reads weekly credit usage and billing cycle reset boundaries.
+  - **Local Model Probing**: Detects running Ollama / LM Studio instances and active models.
+- 📈 **Today's Token Analytics & Prompt Cache ROI**:
+  - Aggregated daily stats: hundreds of millions in context tokens, output tokens, and thinking/reasoning tokens.
+  - Real-time Prompt Cache hit rate calculations (e.g. 97.4% hit rate).
+  - Live inspector capturing the latest 3 interaction rounds (model name, latency, cache hit %, tokens).
+- 🔌 **Built-in Transparent API Key Proxy (Optional)**:
+  - For direct API calls (e.g. routing Claude Code or scripts to GLM, DeepSeek, Kimi, MiniMax, OpenRouter).
+  - Runs a local proxy daemon on `127.0.0.1:18790` with zero configuration needed.
+  - Fetches plan tiers & remaining balances automatically while keeping keys strictly in memory.
+- 🖥️ **macOS Native Craftsmanship**:
+  - Pure Swift native app — starts instantly and sips minimal system resources.
+  - Menu bar icon shows live available memory percentage.
+  - Adaptive panel height with **two-finger trackpad swipe** to switch tabs smoothly.
+
+---
+
+## 🚀 Quick Start
+
+### Method 1: Download Pre-built Binary (Recommended)
+
+1. Download the latest `VibeGauge.zip` from [GitHub Releases](https://github.com/MaxHaiCom/vibe-gauge/releases).
+2. Unzip and drag `VibeGauge.app` into your `/Applications` folder.
+3. Launch it. The icon will appear in your top menu bar.
+
+> **Tip**: On first launch, if prompted by macOS Gatekeeper, click "Open Anyway" in `System Settings → Privacy & Security`. If you use menu-bar management utilities like Bartender or Ice, make sure VibeGauge isn't hidden in a collapsed drawer.
+
+---
+
+### Method 2: Build from Source in 3 Seconds (Zero Dependencies)
+
+No heavy Xcode installation required — only macOS standard command line tools (`swiftc`):
 
 ```bash
+# 1. Clone the repository
 git clone https://github.com/MaxHaiCom/vibe-gauge.git
 cd vibe-gauge
-./build.sh                     # swiftc 直接编译 + 打包 + ad-hoc 签名，无需 Xcode 工程
-open VibeGauge.app
 
-# 不起 UI，校验纯函数并打印一次完整扫描（档位/额度/Token/API 代理）
-./VibeGauge.app/Contents/MacOS/VibeGauge --selftest
-./VibeGauge.app/Contents/MacOS/VibeGauge --install-proxy     # 装/起 API 记账代理（LaunchAgent）
+# 2. Build and bundle
+./build.sh
+
+# 3. Launch
+open VibeGauge.app
 ```
 
-> 若安装了 Bartender 等菜单栏管理工具，新图标可能默认被收进折叠区。
+#### Headless & CLI Flags
+
+```bash
+# Verify parsing logic and output a single terminal snapshot (no UI launched)
+./VibeGauge.app/Contents/MacOS/VibeGauge --selftest
+
+# Install / Uninstall the background API accounting proxy daemon
+./VibeGauge.app/Contents/MacOS/VibeGauge --install-proxy
+./VibeGauge.app/Contents/MacOS/VibeGauge --uninstall-proxy
+```
 
 ---
 
-## 许可
+## 🔍 Data Sources & Freshness
 
-MIT，见 [LICENSE](LICENSE)。
+All subscription tiers, quotas, and token metrics are read strictly from local session logs or vendor cache files:
 
-### 安全边界
+| Provider | Plan Detection | Quotas & Reset Timestamps | Update Frequency |
+|:---|:---|:---|:---|
+| **Claude** | `~/.claude.json`<br>(e.g. `max_5x`, `max_20x`, `pro`) | `~/.claude/claude-usage.json`<br>(Statusline-intercepted 5h / 7d rates & reset points) | Automatically updates on every dialogue round |
+| **Codex** | `~/.codex/auth.json`<br>(JWT `chatgpt_plan_type`) | Session jsonl `rate_limits`<br>(Extracts exact unlock time from `task_complete` errors) | Updates only when requests are actively sent |
+| **Gemini** | Local auth token verification | `~/.cache/agy-hud/quota_cache.json`<br>(Split by primary & 3rd-party model pools) | Refreshed by background helper while agy runs |
+| **Grok** | `~/.grok/settings_cache.json` | `~/.grok/logs/unified.jsonl`<br>(Latest billing credits config & period end) | Periodically flushed by Grok CLI |
+| **Ollama** | Local socket & process probe | Non-quota based (monitors active on-device models) | Instant live status |
 
-- 一切额度与用量数据都来自本机文件或厂商自家的用量接口，不上传任何地方。
-- 记账代理只监听 `127.0.0.1`，把请求原样转发到你在 URL 里指定的上游；它看到的 API key 只保留在进程内存里，用于定时查询该上游的额度，**不落盘、不外发**。记账文件里只有 key 的 8 位指纹，路径的 query string 已抹除。
-- 代理会转发到任意由调用方指定的上游主机，所以它是个本机开发工具：别把端口暴露到局域网，也别在多用户机器上跑。
-- 本工具只读取 CLI 自己写在本机的会话日志与缓存，不碰任何 OAuth token、不代替你登录、不修改任何 CLI 的凭据文件。
+> 📌 *Note*: Footnotes such as "Recorded 1h ago" represent the **timestamp when the vendor CLI last refreshed its local log**, not a lag in VibeGauge. VibeGauge's incremental delta-scanner runs in ~100ms when the panel is open.
+
+---
+
+## 🛠️ API Key Accounting Proxy (Optional)
+
+When routing terminal tools or scripts directly to AI provider endpoints, route requests through the local proxy to capture token analytics and credit balances:
+
+1. **Install Proxy Daemon**:
+   Click "Install API Proxy" in the API tab, or run:
+   ```bash
+   ./VibeGauge.app/Contents/MacOS/VibeGauge --install-proxy
+   ```
+   The proxy listens on `127.0.0.1:18790`.
+
+2. **Zero-Config Routing**:
+   Simply prefix your existing endpoint URL:
+   ```bash
+   # GLM (Zhipu AI)
+   export ANTHROPIC_BASE_URL=http://127.0.0.1:18790/https://open.bigmodel.cn/api/anthropic
+   
+   # DeepSeek
+   export OPENAI_BASE_URL=http://127.0.0.1:18790/https://api.deepseek.com/v1
+   ```
+   *(One-liner to prepend the proxy to all ANTHROPIC_BASE_URL declarations in `~/.zshrc`:)*
+   ```bash
+   perl -pi.bak -e 's#(ANTHROPIC_BASE_URL=["\x27]?)(?!http://127\.0\.0\.1:18790/)(https?://)#$1http://127.0.0.1:18790/$2#' ~/.zshrc
+   ```
+
+3. **Supported Providers**:
+   - **GLM Coding Plan**: Automatic tier & 5h/weekly quota tracking
+   - **OpenRouter**: Real-time remaining balance & credits calculation
+   - **DeepSeek**: Balance endpoint integration
+   - **Kimi / MiniMax / Volcano Ark / MiMo**: Streaming token usage accounting
+
+---
+
+## 🛡️ Privacy & Security
+
+- 🔒 **100% Local Execution**: No analytics, no telemetry, no remote servers. Your token counts and usage data never leave your Mac.
+- 🔑 **Zero Key Disk Logging**: API keys processed by the local proxy remain strictly in volatile process memory for upstream balance checks. Recorded logs only store an 8-character SHA-256 fingerprint; URL query parameters are stripped.
+- ⚙️ **Non-Intrusive**: VibeGauge only reads local logs. It does not tamper with OAuth credentials, proxy your login sessions, or modify vendor configurations.
+- 🛡️ **Whitelisted Safe Reaping**: The process cleaner strictly enforces multi-criteria verification before terminating orphaned processes.
+
+---
+
+## 🤝 Contributing
+
+Contributions, feature requests, and bug reports are warmly welcomed!
+- Discover a new MCP process pattern? Please open a PR to update the signature filters.
+- Vendor changed their log format or introduced a new quota tier? Feel free to submit an issue.
+
+---
+
+## 📄 License
+
+Released under the [MIT License](LICENSE).

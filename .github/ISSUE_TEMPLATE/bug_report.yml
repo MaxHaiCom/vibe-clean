@@ -1,0 +1,31 @@
+name: "Bug Report"
+description: "Report a bug or unexpected behavior in VibeGauge"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to report an issue!
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug clearly. What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: System & Environment
+      description: macOS version, chip (Apple Silicon / Intel), CLI versions (Claude Code / Codex / agy / Grok).
+      placeholder: |
+        - macOS Version: 14.x / 15.x
+        - Mac Chip: M1 / M2 / M3 / M4 / Intel
+        - Active AI CLIs: Claude Code / Codex / etc.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Self-Test Output (Optional)
+      description: Run `./VibeGauge.app/Contents/MacOS/VibeGauge --selftest` and paste the output if applicable.
+      render: shell
