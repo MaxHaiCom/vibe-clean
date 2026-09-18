@@ -98,6 +98,47 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(ProcessScanner.rollingWindow(stamps, seconds: 3600, limit: 0, now: now) == nil, "没填上限就不估")
     }
 
+    // 限流响应头 → 额度（各家写法不同，统一按"去掉 limit/remaining/reset 后同族"配对）
+    do {
+        // Anthropic：族名在前，reset 是 ISO8601
+        let a = ProcessScanner.parseRateLimitHeaders([
+            "anthropic-ratelimit-requests-limit": "1000",
+            "anthropic-ratelimit-requests-remaining": "900",
+            "anthropic-ratelimit-requests-reset": "2026-09-18T12:00:00Z",
+            "anthropic-ratelimit-tokens-limit": "100000",
+            "anthropic-ratelimit-tokens-remaining": "20000",      // 更紧 → 应该选这族
+            "anthropic-ratelimit-tokens-reset": "2026-09-18T12:00:00Z",
+        ], now: now)!
+        precondition(a.usedPct == 80 && a.label == "tokens", "实际 \(a)")
+        precondition(a.resetsAt != nil)
+
+        // OpenAI：kind 在中间，reset 是时长
+        let o = ProcessScanner.parseRateLimitHeaders([
+            "x-ratelimit-limit-requests": "500",
+            "x-ratelimit-remaining-requests": "125",
+            "x-ratelimit-reset-requests": "6m0s",
+        ], now: now)!
+        precondition(o.usedPct == 75 && o.label == "requests", "实际 \(o)")
+        precondition(abs((o.resetsAt ?? 0) - (now + 360)) < 1, "6m0s = 360 秒")
+
+        // GitHub/通用：epoch 秒（真实抓的样本形态）
+        let g = ProcessScanner.parseRateLimitHeaders([
+            "x-ratelimit-limit": "60", "x-ratelimit-remaining": "58",
+            "x-ratelimit-used": "2", "x-ratelimit-resource": "core",
+            "x-ratelimit-reset": "1789727826",
+        ], now: now)!
+        precondition(g.usedPct == 3, "58/60 → 已用 3%，实际 \(g.usedPct)")
+        precondition(abs((g.resetsAt ?? 0) - 1789727826) < 1)
+
+        // 毫秒时间戳 / 纯相对秒数
+        precondition(abs((ProcessScanner.parseResetValue("1789727826000", now: now) ?? 0) - 1789727826) < 1)
+        precondition(abs((ProcessScanner.parseResetValue("30", now: now) ?? 0) - (now + 30)) < 1)
+        precondition(abs((ProcessScanner.parseResetValue("1h2m3s", now: now) ?? 0) - (now + 3723)) < 1)
+        // 没有 limit/remaining 配对就不瞎猜
+        precondition(ProcessScanner.parseRateLimitHeaders(["x-ratelimit-reset": "60"], now: now) == nil)
+        precondition(ProcessScanner.parseRateLimitHeaders(["content-type": "application/json"], now: now) == nil)
+    }
+
     // 记账覆盖体检：只抠变量名与主机，同一行的 key 一律不碰
     do {
         let pfx = "http://127.0.0.1:18790/"
@@ -214,6 +255,7 @@ if CommandLine.arguments.contains("--selftest") {
                      Fmt.ms(p.p50ms), Fmt.ms(p.p95ms), Fmt.ms(p.maxms), p.errors, p.errorRate, p.count429,
                      p.cost.map { String(format: "%.4f %@", $0, p.costCurrency) } ?? "—",
                      p.keys.map { "\($0.fingerprint):\($0.calls)" }.joined(separator: " ")))
+        if let hw = p.headerWindow { print("    限流头: \(p.headerLabel) 已用 \(hw.usedPct)% 重置 \(Fmt.countdown(to: hw.resetsAt, now: now) ?? "?")") }
         if p.quotaIsEstimate { print("    额度=估算 · \(p.estimateNote) · 上限 \(p.planLimitText)") }
     }
     print("--- Token ---")

@@ -563,6 +563,11 @@ def selftest() -> None:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
+                # 限流头：被动记账要能把它们抓下来（各家写法不同，这里用 OpenAI 那种）
+                self.send_header("x-ratelimit-limit-requests", "500")
+                self.send_header("x-ratelimit-remaining-requests", "125")
+                self.send_header("x-ratelimit-reset-requests", "6m0s")
+                self.send_header("x-request-id", "should-not-be-captured")
                 self.end_headers()
                 self.wfile.write(data)
 
@@ -599,8 +604,11 @@ def selftest() -> None:
     assert a["provider"] == "本地" and a["model"] == "glm-4.7" and a["stream"] is True
     assert a["ctx"] == 17 and a["cache_read"] == 5 and a["cache_write"] == 2 and a["out"] == 7 and a["parsed"], a
     assert o["ctx"] == 100 and o["cache_read"] == 60 and o["out"] == 20 and o["think"] == 4 and o["parsed"], o
+    assert o.get("rl") == {"x-ratelimit-limit-requests": "500", "x-ratelimit-remaining-requests": "125",
+                           "x-ratelimit-reset-requests": "6m0s"}, o.get("rl")     # 只收限流头，别的头不收
+    assert "rl" not in a, "上游没给限流头就不该有这个字段"
     assert _keys.get("127.0.0.1:%d" % mport, {}).get("authorization") == "Bearer test"   # 同一 host 后到的 key 覆盖
-    print("selftest OK: 流式 Anthropic + 非流式 OpenAI 解析正确, 记录", CALLS)
+    print("selftest OK: 流式 Anthropic + 非流式 OpenAI 解析正确 + 限流头被动抓取, 记录", CALLS)
 
 
 def main() -> None:

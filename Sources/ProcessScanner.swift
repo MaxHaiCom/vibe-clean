@@ -223,6 +223,9 @@ public struct APIProviderStatus: Identifiable {
     public var fiveHour: QuotaWindow? = nil
     public var sevenDay: QuotaWindow? = nil
     public var monthly: QuotaWindow? = nil
+    /// 从最近一次调用的限流响应头解析出来的余量（被动，不额外发请求）
+    public var headerWindow: QuotaWindow? = nil
+    public var headerLabel: String = ""
     /// 额度是「本机记账的请求数 ÷ 套餐上限」估的（订阅制 Coding Plan 没有公开用量接口）
     public var quotaIsEstimate: Bool = false
     /// 估算的底数，要显示给用户看清这数怎么来的："本机记账 213 次 / 1200"
@@ -1910,6 +1913,7 @@ public final class ProcessScanner {
         let status: Int
         let ms: Int
         let key: String
+        let rl: [String: String]
     }
 
     /// 价目表：`~/.config/vibegauge/prices.json`，单位 = 每百万 token。
@@ -2027,7 +2031,8 @@ public final class ProcessScanner {
                        out: n("out"), think: n("think"),
                        status: (j["status"] as? NSNumber)?.intValue ?? 0,
                        ms: (j["ms"] as? NSNumber)?.intValue ?? 0,
-                       key: j["key"] as? String ?? "")
+                       key: j["key"] as? String ?? "",
+                       rl: (j["rl"] as? [String: Any])?.compactMapValues { $0 as? String } ?? [:])
     }
 
     /// api-calls.jsonl 也是 append-only：同样的 offset 增量 + 指纹识别重写；
@@ -2064,6 +2069,75 @@ public final class ProcessScanner {
         apiFile.size = size
         let horizon = Date().timeIntervalSince1970 - 31 * 86400
         if let first = apiCalls.first, first.ts < horizon { apiCalls.removeAll { $0.ts < horizon } }
+    }
+
+    // MARK: 限流响应头 → 额度（代理被动记下来的，不为查额度多发一个请求）
+
+    /// 把一组 `*ratelimit*` 响应头解析成「已用 % + 重置时刻」。
+    /// 各家写法不一，统一按「去掉 limit/remaining/reset 这个词，剩下的算同一族」来配对：
+    /// - Anthropic：`anthropic-ratelimit-requests-limit|-remaining|-reset`（reset 是 ISO8601）
+    /// - OpenAI：`x-ratelimit-limit-requests|-remaining-requests|-reset-requests`（reset 是 "6m0s" 这种时长）
+    /// - GitHub/通用：`x-ratelimit-limit|-remaining|-reset`（reset 是 epoch 秒；有的家给毫秒）
+    /// 多族并存时取最紧的那族（剩得最少的），标签带上族名让用户知道是按什么限的。
+    public static func parseRateLimitHeaders(_ headers: [String: String],
+                                             now: TimeInterval = Date().timeIntervalSince1970)
+        -> (usedPct: Int, resetsAt: TimeInterval?, label: String)? {
+        var fams: [String: (limit: Double?, remaining: Double?, reset: String?)] = [:]
+        for (rawKey, value) in headers {
+            let key = rawKey.lowercased()
+            guard key.contains("ratelimit") || key.contains("rate-limit") else { continue }
+            var parts = key.split(separator: "-").map(String.init)
+            guard let idx = parts.firstIndex(where: { ["limit", "remaining", "reset"].contains($0) }) else { continue }
+            let kind = parts.remove(at: idx)
+            let family = parts.joined(separator: "-")
+            var f = fams[family] ?? (nil, nil, nil)
+            switch kind {
+            case "limit": f.limit = Double(value)
+            case "remaining": f.remaining = Double(value)
+            default: f.reset = value
+            }
+            fams[family] = f
+        }
+
+        var best: (usedPct: Int, resetsAt: TimeInterval?, label: String)? = nil
+        for (family, f) in fams {
+            guard let limit = f.limit, limit > 0, let remaining = f.remaining else { continue }
+            let used = Int(((limit - remaining) / limit * 100).rounded())
+            let reset = f.reset.flatMap { parseResetValue($0, now: now) }
+            // 族名里去掉噪声词，剩下 requests/tokens 这类才有信息量
+            let name = family.split(separator: "-").filter { !["x", "anthropic", "ratelimit", "rate", "openai"].contains($0) }
+                .joined(separator: "-")
+            let label = name.isEmpty ? "限流" : name
+            if best == nil || used > best!.usedPct { best = (max(0, min(100, used)), reset, label) }
+        }
+        return best
+    }
+
+    /// reset 字段三种写法：epoch 秒 / epoch 毫秒 / 相对时长（"6m0s"、"30s"、"1500ms"）/ ISO8601
+    static func parseResetValue(_ raw: String, now: TimeInterval) -> TimeInterval? {
+        let v = raw.trimmingCharacters(in: .whitespaces)
+        if let iso = Fmt.parseISODate(v) { return iso }
+        if let n = Double(v) {
+            if n > 1_000_000_000_000 { return n / 1000 }     // 毫秒时间戳
+            if n > 1_000_000_000 { return n }                // 秒时间戳
+            return now + n                                   // 纯数字的相对秒数
+        }
+        // "6m0s" / "1h2m3s" / "500ms"
+        guard let re = try? NSRegularExpression(pattern: #"(\d+(?:\.\d+)?)(ms|h|m|s)"#) else { return nil }
+        let ns = v as NSString
+        let ms = re.matches(in: v, range: NSRange(location: 0, length: ns.length))
+        guard !ms.isEmpty else { return nil }
+        var secs = 0.0
+        for m in ms {
+            let n = Double(ns.substring(with: m.range(at: 1))) ?? 0
+            switch ns.substring(with: m.range(at: 2)) {
+            case "ms": secs += n / 1000
+            case "h": secs += n * 3600
+            case "m": secs += n * 60
+            default: secs += n
+            }
+        }
+        return now + secs
     }
 
     // MARK: 额度采样（算"当前节奏"用）
@@ -2236,6 +2310,18 @@ public final class ProcessScanner {
             if let cost = cost { k.cost = (k.cost ?? 0) + cost }
             if !k.models.contains(c.model) { k.models.append(c.model) }
             byKey[c.host, default: [:]][fp] = k
+        }
+
+        // 限流头：只认该上游最近一条带头的调用（旧的没参考价值）
+        var lastRL: [String: (t: TimeInterval, rl: [String: String])] = [:]
+        for c in apiCalls where !c.rl.isEmpty {
+            if c.ts > (lastRL[c.host]?.t ?? 0) { lastRL[c.host] = (c.ts, c.rl) }
+        }
+        for (host, v) in lastRL {
+            guard now - v.t < 3600,                              // 一小时前的余量早就变了
+                  let q = Self.parseRateLimitHeaders(v.rl, now: now) else { continue }
+            byHost[host]?.headerWindow = QuotaWindow(usedPct: q.usedPct, resetsAt: q.resetsAt, capturedAt: v.t)
+            byHost[host]?.headerLabel = q.label
         }
 
         for (host, ms) in latency {

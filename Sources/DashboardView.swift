@@ -171,8 +171,16 @@ public struct DashboardView: View {
                 let models = p.models.prefix(2).joined(separator: " / ") + (p.models.count > 2 ? " …" : "")
                 tokens = "\(models) · 上下文 \(formatTokens(p.ctx)) · 输出 \(formatTokens(p.out))" + (p.ctx > 0 ? String(format: " · 命中 %.0f%%", p.cacheHitRate) : "")
             }
+            // 上游在真实调用里给了限流头 → 拿来当余量显示（被动，不额外发请求）
+            var headerLine = ""
+            if let hw = p.headerWindow {
+                let pct = hw.effectivePct(now: nowTS)
+                headerLine = "限流 \(p.headerLabel) 已用 \(pct)%"
+                if let c = Fmt.countdown(to: hw.resetsAt, now: nowTS) { headerLine += " · 重置 \(c)" }
+            }
             let sub: String
-            if !p.balanceText.isEmpty { sub = p.balanceText }
+            if !headerLine.isEmpty, p.balanceText.isEmpty, p.fiveHour == nil { sub = headerLine }
+            else if !p.balanceText.isEmpty { sub = p.balanceText }
             else if !p.quotaError.isEmpty { sub = "额度: " + String(p.quotaError.prefix(24)) }   // 如"当前用户不存在coding plan"
             else { sub = p.calls > 0 ? "无额度接口 · 只记调用" : "今日无调用" }
 
@@ -225,6 +233,12 @@ public struct DashboardView: View {
             d.rows.append(("今日花费（估）", money(c, p.costCurrency) + (currentAPI.priceAsOf.isEmpty ? "" : " · 价目表 \(currentAPI.priceAsOf)")))
         } else if p.calls > 0 {
             d.rows.append(("今日花费", currentAPI.hasPriceTable ? "该模型不在价目表里" : "未配置价目表"))
+        }
+        if let hw = p.headerWindow {
+            var v = "已用 \(hw.effectivePct(now: nowTS))%（按 \(p.headerLabel)）"
+            if let c = Fmt.countdown(to: hw.resetsAt, now: nowTS) { v += " · 重置 \(c)" }
+            if let age = hw.ageSeconds(now: nowTS) { v += " · 取自 \(Fmt.agoShort(age))的调用" }
+            d.rows.append(("限流余量（响应头）", v))
         }
         if !p.models.isEmpty { d.rows.append(("模型", p.models.joined(separator: ", "))) }
         if !p.balanceText.isEmpty { d.rows.append(("余额", p.balanceText)) }
