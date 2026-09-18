@@ -137,12 +137,27 @@ public struct DetectedLLMRuntime: Identifiable {
     public var quotaSubtitle: String = ""
     /// 卡片第三行附加信息（API Key 卡片用：模型 + 今日 token）
     public var extraLine: String = ""
+    /// 卡片第四行（API Key 卡片用：p95 延迟 / 错误率 / 花费）
+    public var extraLine2: String = ""
     /// 一个套餐带多个模型各自额度（如 OpenCode Zen）：卡内只显示用得最紧的 3 个，其余折叠
     public var subQuotas: [SubQuota] = []
 
     public var platformDetail: PlatformDetail = PlatformDetail()
 
     public var hasQuota: Bool { fiveHour != nil || sevenDay != nil || secondaryFiveHour != nil || secondarySevenDay != nil }
+}
+
+/// 一个 API Key（只存代理写下的 SHA-256 前 8 位指纹，永不落明文）今日的用量
+public struct APIKeyUsage: Identifiable {
+    public var id: String { fingerprint }
+    public let fingerprint: String
+    public var calls: Int = 0
+    public var errors: Int = 0
+    public var ctx: Int64 = 0
+    public var out: Int64 = 0
+    public var lastTS: TimeInterval = 0
+    public var cost: Double? = nil
+    public var models: [String] = []
 }
 
 /// 经记账代理的某个上游：今日调用汇总 + 额度/余额
@@ -164,10 +179,25 @@ public struct APIProviderStatus: Identifiable {
     public var balanceText: String = ""
     public var quotaError: String = ""
     public var cacheHitRate: Double { ctx > 0 ? Double(cacheRead) / Double(ctx) * 100.0 : 0.0 }
+
+    // 可观测性（全部由 api-calls.jsonl 里已有的 status/ms/key 字段算出）
+    public var p50ms: Int = 0
+    public var p95ms: Int = 0
+    public var maxms: Int = 0
+    public var count429: Int = 0
+    /// nil = 没配价目表，不估（不编价格）
+    public var cost: Double? = nil
+    public var costCurrency: String = ""
+    public var keys: [APIKeyUsage] = []
+    public var errorRate: Double { calls > 0 ? Double(errors) / Double(calls) * 100.0 : 0.0 }
 }
 
 public struct ProxyStatus {
     public var installed: Bool = false
+    /// 价目表状态（没配就别在界面上编花费）
+    public var hasPriceTable: Bool = false
+    public var priceAsOf: String = ""
+
     public var running: Bool = false
     public var port: Int = 18790
     public var callsSinceStart: Int = 0
@@ -212,6 +242,89 @@ public struct ScanReport {
     public var allOrphanPids: [Int] = []
     public var totalOrphanCount: Int = 0
     public var totalOrphanMemMB: Double = 0.0
+}
+
+// MARK: - 压力信号（菜单栏图标 + 阈值通知共用，纯计算可自测）
+
+/// 一条统一方向的"压力"信号：pct 越大越紧张。
+/// 额度本来就是"已用 %"；内存/磁盘取"已用 %"后与额度同向，可放在一起比。
+public struct PressureSignal: Identifiable, Equatable {
+    public enum Kind: Equatable { case quota, memory, disk }
+
+    /// 去重键：通知状态按它记。额度键里带重置点，换窗口后自然是新键，能再报一次
+    public let key: String
+    public let short: String        // 短名，进图标旁的文字与通知标题
+    public let pct: Int
+    public let detail: String       // 通知正文
+    public let kind: Kind
+
+    public var id: String { key }
+
+    /// 各信号自己的报警线：内存 85% 已用才算紧，磁盘要到 90%，额度 80% 就该收手
+    public var warn: Int {
+        switch kind {
+        case .quota: return 80
+        case .memory: return 85
+        case .disk: return 90
+        }
+    }
+    public var crit: Int {
+        switch kind {
+        case .quota: return 95
+        case .memory: return 93
+        case .disk: return 96
+        }
+    }
+    /// 0 = 正常，1 = 警告，2 = 危急
+    public var level: Int { pct >= crit ? 2 : (pct >= warn ? 1 : 0) }
+    /// 离自己报警线还差多少（正数 = 已越线）。排序按它，而不是按 pct，
+    /// 否则"内存已用 60%"会永远压住"额度已用 55%"，而后者其实更该被看见
+    public var margin: Int { pct - warn }
+}
+
+public extension ScanReport {
+    /// 全部压力信号，按"离各自报警线的距离"倒序。没数据的额度窗口不参与（不编）
+    var pressures: [PressureSignal] {
+        var out: [PressureSignal] = []
+
+        func addQuota(_ w: QuotaWindow?, _ platform: String, _ pool: String) {
+            guard let w = w else { return }
+            let pct = w.effectivePct()
+            var detail = "已用 \(pct)%"
+            if let c = Fmt.countdown(to: w.resetsAt) { detail += " · 重置 \(c)" }
+            let stamp = w.resetsAt.map { String(Int($0)) } ?? "na"
+            out.append(PressureSignal(key: "quota:\(platform):\(pool)@\(stamp)",
+                                      short: "\(platform) \(pool)", pct: pct, detail: detail, kind: .quota))
+        }
+
+        for l in detectedLLMs {
+            addQuota(l.fiveHour, l.name, "5h")
+            addQuota(l.sevenDay, l.name, "周")
+            let sec = l.secondaryPoolName.isEmpty ? "副池" : l.secondaryPoolName
+            addQuota(l.secondaryFiveHour, l.name, "\(sec) 5h")
+            addQuota(l.secondarySevenDay, l.name, "\(sec) 周")
+            for s in l.subQuotas { addQuota(s.window, l.name, s.name) }
+        }
+        for p in api.providers {
+            addQuota(p.fiveHour, p.provider, "5h")
+            addQuota(p.sevenDay, p.provider, "周")
+        }
+
+        if totalMemoryGB > 0 {
+            out.append(PressureSignal(key: "mem", short: "内存", pct: max(0, 100 - freePercentage),
+                                      detail: String(format: "已用 %.1f / %.1f GB · swap %.2f GB",
+                                                     usedMemoryGB, totalMemoryGB, swapUsedGB), kind: .memory))
+        }
+        if diskTotalGB > 0 {
+            out.append(PressureSignal(key: "disk", short: "磁盘", pct: Int((100.0 - diskFreePct).rounded()),
+                                      detail: String(format: "剩余 %.0f GB / %.0f GB", diskFreeGB, diskTotalGB), kind: .disk))
+        }
+
+        return out.sorted { $0.margin != $1.margin ? $0.margin > $1.margin : $0.pct > $1.pct }
+    }
+
+    /// 最紧的那一条 —— 菜单栏图标画它
+    var tightest: PressureSignal? { pressures.first }
 }
 
 // MARK: - 纯展示格式化（可自测）
@@ -299,6 +412,22 @@ public enum Fmt {
         let text = "\(month) \(g(2)), \(g(3)) \(g(4)):\(g(5)) \(g(6).uppercased())M"
         usageResetFormatter.timeZone = TimeZone.current
         return usageResetFormatter.date(from: text)?.timeIntervalSince1970
+    }
+
+    /// 最近秩百分位（样本少的时候比插值直观：p95 一定是某次真实调用的耗时）
+    public static func percentile(_ values: [Int], _ p: Double) -> Int {
+        guard !values.isEmpty else { return 0 }
+        let s = values.sorted()
+        let idx = Int((p * Double(s.count)).rounded(.up)) - 1
+        return s[max(0, min(s.count - 1, idx))]
+    }
+
+    /// 毫秒 → "312ms" / "4.3s" / "1m02s"
+    public static func ms(_ v: Int) -> String {
+        if v <= 0 { return "—" }
+        if v < 1000 { return "\(v)ms" }
+        if v < 60_000 { return String(format: "%.1fs", Double(v) / 1000.0) }
+        return String(format: "%dm%02ds", v / 60_000, (v % 60_000) / 1000)
     }
 
     /// 相对时间："刚刚" / "35秒前" / "12分钟前" / "3小时前"
@@ -1548,9 +1677,71 @@ public final class ProcessScanner {
         let model: String
         let ctx: Int64
         let cacheRead: Int64
+        let cacheWrite: Int64
         let out: Int64
         let think: Int64
         let status: Int
+        let ms: Int
+        let key: String
+    }
+
+    /// 价目表：`~/.config/vibegauge/prices.json`，单位 = 每百万 token。
+    /// ```
+    /// { "_asof": "2026-09-18", "_currency": "CNY",
+    ///   "glm-4.7": { "in": 0.6, "cache_read": 0.11, "cache_write": 0.6, "out": 2.2 } }
+    /// ```
+    /// 没这文件就不估花费 —— 价格会变，编一个假的比不显示更糟。模型名取「最长前缀命中」。
+    public struct PriceTable {
+        public struct Row { public var input = 0.0, cacheRead = 0.0, cacheWrite = 0.0, output = 0.0 }
+        public var rows: [String: Row] = [:]
+        public var currency: String = ""
+        public var asOf: String = ""
+        public var isEmpty: Bool { rows.isEmpty }
+
+        public init() {}
+        public init(json: [String: Any]) {
+            currency = (json["_currency"] as? String) ?? "USD"
+            asOf = (json["_asof"] as? String) ?? ""
+            for (k, v) in json where !k.hasPrefix("_") {
+                guard let d = v as? [String: Any] else { continue }
+                func f(_ key: String) -> Double { (d[key] as? NSNumber)?.doubleValue ?? 0 }
+                var r = Row()
+                r.input = f("in"); r.output = f("out")
+                r.cacheRead = d["cache_read"] == nil ? r.input : f("cache_read")
+                r.cacheWrite = d["cache_write"] == nil ? r.input : f("cache_write")
+                // 全 0 视为"没填价"（示例文件里的占位行不该算出 ¥0.00 的假花费）
+                if r.input == 0, r.output == 0, r.cacheRead == 0, r.cacheWrite == 0 { continue }
+                rows[k.lowercased()] = r
+            }
+        }
+
+        func row(for model: String) -> Row? {
+            let m = model.lowercased()
+            if let exact = rows[m] { return exact }
+            // 最长前缀命中："glm-4.7" 能覆盖 "glm-4.7-flash"；取最长的那条，避免被短名抢走
+            return rows.filter { m.hasPrefix($0.key) }.max { $0.key.count < $1.key.count }?.value
+        }
+
+        /// ctx 是「全部输入」（新鲜 + 缓存读 + 缓存写），算价时要先把缓存部分扣出来
+        public func cost(model: String, ctx: Int64, cacheRead: Int64, cacheWrite: Int64, out: Int64) -> Double? {
+            guard let r = row(for: model) else { return nil }
+            let fresh = max(0, ctx - cacheRead - cacheWrite)
+            return (Double(fresh) * r.input + Double(cacheRead) * r.cacheRead
+                    + Double(cacheWrite) * r.cacheWrite + Double(out) * r.output) / 1_000_000.0
+        }
+    }
+
+    private var priceCache: (mtime: TimeInterval, table: PriceTable)? = nil
+
+    private func priceTable() -> PriceTable {
+        let path = "\(home)/.config/vibegauge/prices.json"
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let mod = attrs[.modificationDate] as? Date else { return PriceTable() }
+        let mtime = mod.timeIntervalSince1970
+        if let c = priceCache, c.mtime == mtime { return c.table }
+        let t = readJSON(path).map { PriceTable(json: $0) } ?? PriceTable()
+        priceCache = (mtime, t)
+        return t
     }
     private var apiCalls: [APICall] = []
     private var apiFile = FileParseState()          // 只用 mtime/size/parsedOffset/head
@@ -1564,8 +1755,11 @@ public final class ProcessScanner {
         func n(_ k: String) -> Int64 { Int64((j[k] as? NSNumber)?.intValue ?? 0) }
         return APICall(ts: ts, host: host, provider: j["provider"] as? String ?? host,
                        model: (j["model"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "?",
-                       ctx: n("ctx"), cacheRead: n("cache_read"), out: n("out"), think: n("think"),
-                       status: (j["status"] as? NSNumber)?.intValue ?? 0)
+                       ctx: n("ctx"), cacheRead: n("cache_read"), cacheWrite: n("cache_write"),
+                       out: n("out"), think: n("think"),
+                       status: (j["status"] as? NSNumber)?.intValue ?? 0,
+                       ms: (j["ms"] as? NSNumber)?.intValue ?? 0,
+                       key: j["key"] as? String ?? "")
     }
 
     /// api-calls.jsonl 也是 append-only：同样的 offset 增量 + 指纹识别重写；只保留 48h 内记录
@@ -1633,18 +1827,49 @@ public final class ProcessScanner {
 
         ingestAPICalls()
         let startOfToday = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+        let prices = priceTable()
         var byHost: [String: APIProviderStatus] = [:]
+        var latency: [String: [Int]] = [:]              // host → 今日各次耗时（算 p50/p95）
+        var byKey: [String: [String: APIKeyUsage]] = [:]  // host → 指纹 → 用量
+
         for c in apiCalls where c.ts >= startOfToday {
             var p = byHost[c.host] ?? APIProviderStatus(host: c.host, provider: c.provider)
             p.calls += 1
             if c.status >= 400 || c.status == 0 { p.errors += 1 }
+            if c.status == 429 { p.count429 += 1 }
             p.ctx += c.ctx
             p.cacheRead += c.cacheRead
             p.out += c.out
             p.think += c.think
             p.lastTS = max(p.lastTS, c.ts)
             if !p.models.contains(c.model) { p.models.append(c.model) }
+
+            let cost = prices.cost(model: c.model, ctx: c.ctx, cacheRead: c.cacheRead, cacheWrite: c.cacheWrite, out: c.out)
+            if let cost = cost { p.cost = (p.cost ?? 0) + cost }
             byHost[c.host] = p
+
+            if c.ms > 0 { latency[c.host, default: []].append(c.ms) }
+
+            let fp = c.key.isEmpty ? "无 key" : c.key
+            var k = byKey[c.host]?[fp] ?? APIKeyUsage(fingerprint: fp)
+            k.calls += 1
+            if c.status >= 400 || c.status == 0 { k.errors += 1 }
+            k.ctx += c.ctx
+            k.out += c.out
+            k.lastTS = max(k.lastTS, c.ts)
+            if let cost = cost { k.cost = (k.cost ?? 0) + cost }
+            if !k.models.contains(c.model) { k.models.append(c.model) }
+            byKey[c.host, default: [:]][fp] = k
+        }
+
+        for (host, ms) in latency {
+            byHost[host]?.p50ms = Fmt.percentile(ms, 0.50)
+            byHost[host]?.p95ms = Fmt.percentile(ms, 0.95)
+            byHost[host]?.maxms = ms.max() ?? 0
+        }
+        for (host, keys) in byKey {
+            byHost[host]?.keys = keys.values.sorted { $0.calls > $1.calls }
+            byHost[host]?.costCurrency = prices.currency
         }
         if let q = readJSON(pm.quotaPath) {
             for (host, v) in q {
@@ -1668,6 +1893,8 @@ public final class ProcessScanner {
                 byHost[host] = p
             }
         }
+        st.hasPriceTable = !prices.isEmpty
+        st.priceAsOf = prices.asOf
         st.providers = byHost.values.sorted { $0.lastTS > $1.lastTS }
         return st
     }

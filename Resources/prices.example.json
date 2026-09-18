@@ -1,0 +1,11 @@
+{
+  "_comment": "复制到 ~/.config/vibegauge/prices.json 后自己填价。单位 = 每百万 token。VibeGauge 不内置价目表：价格随时在变，编一个假的比不显示更糟。全 0 的行视为「没填价」，面板上会显示「该模型不在价目表里」而不是 0.00。模型名按最长前缀命中，所以填 \"glm-4.7\" 就能覆盖 \"glm-4.7-flash\"。cache_read / cache_write 省略时按 in 计。",
+  "_asof": "填你抄价那天的日期，面板会显示它，提醒你这数字有多旧",
+  "_currency": "CNY",
+
+  "glm-4.7": { "in": 0, "cache_read": 0, "cache_write": 0, "out": 0 },
+  "kimi-k2": { "in": 0, "out": 0 },
+  "deepseek-chat": { "in": 0, "cache_read": 0, "out": 0 },
+  "doubao-seed": { "in": 0, "out": 0 },
+  "qwen": { "in": 0, "out": 0 }
+}

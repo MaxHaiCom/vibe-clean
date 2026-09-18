@@ -48,6 +48,45 @@ if CommandLine.arguments.contains("--selftest") {
     precondition(Fmt.parseUsageLimitReset("try again at Oct 1st, 2026 12:00 AM") != nil)
     precondition(Fmt.parseUsageLimitReset("no reset info here") == nil)
 
+    // 压力信号排序：按"离各自报警线的距离"，不按百分比（内存 60% 不该压住额度 55%）
+    do {
+        var s = ScanReport()
+        s.totalMemoryGB = 64; s.freePercentage = 40          // 内存已用 60%，线 85 → margin -25
+        s.diskTotalGB = 1000; s.diskFreeGB = 500; s.diskFreePct = 50   // 已用 50%，线 90 → margin -40
+        s.detectedLLMs = [DetectedLLMRuntime(name: "Claude", isRunning: true, tier: "Max", detail: "",
+                                             fiveHour: QuotaWindow(usedPct: 55, resetsAt: now + 3600, capturedAt: now))]
+        precondition(s.tightest?.short == "内存", "60% 内存该压住 55% 额度（离线更近）")
+        precondition(s.tightest?.level == 0)
+        s.detectedLLMs[0].fiveHour = QuotaWindow(usedPct: 82, resetsAt: now + 3600, capturedAt: now)
+        precondition(s.tightest?.short == "Claude 5h" && s.tightest?.level == 1, "额度 82% 越线 → 最紧且报警")
+        s.detectedLLMs[0].fiveHour = QuotaWindow(usedPct: 99, resetsAt: now - 1, capturedAt: now)
+        precondition(s.pressures.first(where: { $0.short == "Claude 5h" })?.pct == 0, "过了重置点的旧值不许再报警")
+        precondition(s.pressures.contains { $0.short == "磁盘" })
+    }
+
+    // 百分位取最近秩：p95 一定落在某次真实调用上
+    precondition(Fmt.percentile([100], 0.95) == 100)
+    precondition(Fmt.percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.5) == 5)
+    precondition(Fmt.percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.95) == 10)
+    precondition(Fmt.percentile([], 0.5) == 0)
+    precondition(Fmt.ms(0) == "—" && Fmt.ms(312) == "312ms" && Fmt.ms(4298) == "4.3s" && Fmt.ms(62_000) == "1m02s")
+
+    // 价目表：ctx 是"全部输入"，算价前要把缓存读/写扣出来，否则新鲜 token 会被重复计价
+    do {
+        let t = ProcessScanner.PriceTable(json: [
+            "_currency": "CNY", "_asof": "2026-09-18",
+            "glm-4.7": ["in": 4.0, "cache_read": 1.0, "cache_write": 5.0, "out": 12.0],
+            "zero-price-placeholder": ["in": 0, "out": 0],
+        ])
+        // 新鲜 60w + 缓存读 30w + 缓存写 10w + 输出 10w
+        let c = t.cost(model: "glm-4.7", ctx: 1_000_000, cacheRead: 300_000, cacheWrite: 100_000, out: 100_000)!
+        precondition(abs(c - (0.6 * 4.0 + 0.3 * 1.0 + 0.1 * 5.0 + 0.1 * 12.0)) < 1e-9, "算出来 \(c)")
+        precondition(t.cost(model: "glm-4.7-flash", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 0) != nil, "前缀命中")
+        precondition(t.cost(model: "unknown-model", ctx: 999, cacheRead: 0, cacheWrite: 0, out: 9) == nil, "没价的模型不许估")
+        precondition(t.cost(model: "zero-price-placeholder", ctx: 999, cacheRead: 0, cacheWrite: 0, out: 9) == nil, "占位行不算价")
+        precondition(ProcessScanner.PriceTable().isEmpty)
+    }
+
     let t0 = Date()
     let r = ProcessScanner.shared.scan()
     let t1 = Date()
@@ -60,6 +99,10 @@ if CommandLine.arguments.contains("--selftest") {
         for o in r.orphans { print(String(format: "  pid %-7d %5.0f MB  %@", o.pid, o.memMB, String(o.cmd.prefix(90)))) }
         print("--- 规则放过的（原因）---")
         for p in r.protected { print(String(format: "  pid %-7d %5.0f MB  [%@]  %@", p.pid, p.memMB, p.reason, String(p.cmd.prefix(70)))) }
+    }
+    print("--- 压力信号（图标画第一条）---")
+    for s in r.pressures.prefix(8) {
+        print(String(format: "  %-16@ %3d%%  线 %d/%d  margin %+d  level %d  %@", s.short, s.pct, s.warn, s.crit, s.margin, s.level, s.detail))
     }
     print("--- 平台 ---")
     func w(_ label: String, _ q: QuotaWindow?) -> String {
@@ -75,7 +118,12 @@ if CommandLine.arguments.contains("--selftest") {
     print("Codex 远程 \(rs.host): \(rs.ok ? "已连上" : "未连上") · \(rs.ageSeconds)s 前拉取")
     let a = r.api
     print("--- API 代理 --- 安装=\(a.installed) 运行=\(a.running) 端口=\(a.port) 启动后调用=\(a.callsSinceStart)")
+    print("  价目表: " + (a.hasPriceTable ? "已配置 \(a.priceAsOf)" : "未配置（~/.config/vibegauge/prices.json）"))
     for p in a.providers {
+        print(String(format: "    延迟 p50 %@ p95 %@ 最慢 %@ · 错误 %d(%.1f%%) 429 %d · 花费 %@ · key %@",
+                     Fmt.ms(p.p50ms), Fmt.ms(p.p95ms), Fmt.ms(p.maxms), p.errors, p.errorRate, p.count429,
+                     p.cost.map { String(format: "%.4f %@", $0, p.costCurrency) } ?? "—",
+                     p.keys.map { "\($0.fingerprint):\($0.calls)" }.joined(separator: " ")))
         print("  \(p.provider) [\(p.host)] 今日 \(p.calls) 次 ctx \(p.ctx) cache \(p.cacheRead) out \(p.out) think \(p.think) 模型 \(p.models.joined(separator: ",")) \(p.plan) \(p.balanceText) \(p.fiveHour.map { "5H \($0.usedPct)%" } ?? "") \(p.sevenDay.map { "W \($0.usedPct)%" } ?? "") \(p.quotaError)")
     }
     print("--- Token ---")

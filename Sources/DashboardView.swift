@@ -99,6 +99,7 @@ public struct PanelActions {
     public var rescan: () -> Void = {}
     public var setAutoClean: (Bool) -> Void = { _ in }
     public var setLaunchAtLogin: (Bool) -> Void = { _ in }
+    public var setThresholdNotify: (Bool) -> Void = { _ in }
     public var installProxy: () -> Void = {}
     public var uninstallProxy: () -> Void = {}
     public var copyProxyPrefix: () -> Void = {}
@@ -110,9 +111,11 @@ public struct PanelActions {
 public struct PanelSettings {
     public var autoClean: Bool = false
     public var launchAtLogin: Bool = false
-    public init(autoClean: Bool = false, launchAtLogin: Bool = false) {
+    public var thresholdNotify: Bool = true
+    public init(autoClean: Bool = false, launchAtLogin: Bool = false, thresholdNotify: Bool = true) {
         self.autoClean = autoClean
         self.launchAtLogin = launchAtLogin
+        self.thresholdNotify = thresholdNotify
     }
 }
 
@@ -132,6 +135,7 @@ public struct DashboardView: View {
     @State private var drillDown: String? = nil      // 非空 = 正在看某个平台的详情页
     @State private var autoCleanOn: Bool
     @State private var launchAtLoginOn: Bool
+    @State private var notifyOn: Bool
 
     @State private var liveNow: Date = Date()
     @State private var pulseAnim: Bool = false
@@ -148,6 +152,7 @@ public struct DashboardView: View {
         self.actions = actions
         _autoCleanOn = State(initialValue: settings.autoClean)
         _launchAtLoginOn = State(initialValue: settings.launchAtLogin)
+        _notifyOn = State(initialValue: settings.thresholdNotify)
     }
 
     private var nowTS: TimeInterval { liveNow.timeIntervalSince1970 }
@@ -169,11 +174,60 @@ public struct DashboardView: View {
             if !p.balanceText.isEmpty { sub = p.balanceText }
             else if !p.quotaError.isEmpty { sub = "额度: " + String(p.quotaError.prefix(24)) }   // 如"当前用户不存在coding plan"
             else { sub = p.calls > 0 ? "无额度接口 · 只记调用" : "今日无调用" }
+
+            // 第四行：延迟 + 错误 + 花费，都从记账文件里已有的字段算，没有就不写
+            var obs: [String] = []
+            if p.p95ms > 0 { obs.append("p50 \(Fmt.ms(p.p50ms)) · p95 \(Fmt.ms(p.p95ms))") }
+            if p.errors > 0 { obs.append(String(format: "%d 错(%.0f%%)", p.errors, p.errorRate) + (p.count429 > 0 ? " 含 \(p.count429) 限流" : "")) }
+            if let c = p.cost { obs.append(money(c, p.costCurrency)) }
             return DetectedLLMRuntime(
                 name: p.provider, isRunning: nowTS - p.lastTS < 120, tier: p.plan.isEmpty ? "API Key" : p.plan, detail: "\(p.calls) 次",
-                fiveHour: p.fiveHour, sevenDay: p.sevenDay, quotaSubtitle: sub, extraLine: tokens
+                fiveHour: p.fiveHour, sevenDay: p.sevenDay, quotaSubtitle: sub,
+                extraLine: tokens, extraLine2: obs.joined(separator: " · "),
+                platformDetail: apiDetail(p)
             )
         }
+    }
+
+    private func money(_ v: Double, _ currency: String) -> String {
+        let sym = currency == "CNY" ? "¥" : (currency == "USD" ? "$" : currency + " ")
+        return v < 0.01 && v > 0 ? "\(sym)<0.01" : String(format: "%@%.2f", sym, v)
+    }
+
+    /// API 上游的详情页：把记账文件能证明的都列出来（延迟分位 / 错误 / 按 key 分账 / 模型）
+    private func apiDetail(_ p: APIProviderStatus) -> PlatformDetail {
+        var d = PlatformDetail()
+        d.rows.append(("上游主机", p.host))
+        if !p.plan.isEmpty { d.rows.append(("套餐", p.plan)) }
+        d.rows.append(("今日调用", "\(p.calls) 次"))
+        if p.p95ms > 0 {
+            d.rows.append(("延迟 p50 / p95", "\(Fmt.ms(p.p50ms)) / \(Fmt.ms(p.p95ms))"))
+            d.rows.append(("最慢一次", Fmt.ms(p.maxms)))
+        }
+        d.rows.append(("错误率", p.calls > 0 ? String(format: "%.1f%%（%d / %d）", p.errorRate, p.errors, p.calls) : "—"))
+        if p.count429 > 0 { d.rows.append(("429 限流", "\(p.count429) 次")) }
+        if p.ctx > 0 {
+            d.rows.append(("输入 / 输出", "\(formatTokens(p.ctx)) / \(formatTokens(p.out))"))
+            d.rows.append(("缓存命中", String(format: "%.0f%%（读 %@）", p.cacheHitRate, formatTokens(p.cacheRead))))
+        }
+        if let c = p.cost {
+            d.rows.append(("今日花费（估）", money(c, p.costCurrency) + (currentAPI.priceAsOf.isEmpty ? "" : " · 价目表 \(currentAPI.priceAsOf)")))
+        } else if p.calls > 0 {
+            d.rows.append(("今日花费", currentAPI.hasPriceTable ? "该模型不在价目表里" : "未配置价目表"))
+        }
+        if !p.models.isEmpty { d.rows.append(("模型", p.models.joined(separator: ", "))) }
+        if !p.balanceText.isEmpty { d.rows.append(("余额", p.balanceText)) }
+        if !p.quotaError.isEmpty { d.rows.append(("额度接口", p.quotaError)) }
+        for k in p.keys {
+            var v = "\(k.calls) 次"
+            if k.errors > 0 { v += " · \(k.errors) 错" }
+            if k.ctx > 0 { v += " · \(formatTokens(k.ctx))→\(formatTokens(k.out))" }
+            if let c = k.cost { v += " · " + money(c, p.costCurrency) }
+            d.rows.append(("key \(k.fingerprint)", v))
+        }
+        d.sourceFiles = ["~/.config/vibegauge/api-calls.jsonl", "~/.config/vibegauge/api-quota.json"]
+        if currentAPI.hasPriceTable { d.sourceFiles.append("~/.config/vibegauge/prices.json") }
+        return d
     }
 
     private func secondsAgo(_ timestamp: TimeInterval) -> Int {
@@ -306,7 +360,7 @@ public struct DashboardView: View {
 
             SwipeScroll(
                 content: VStack(alignment: .leading, spacing: 10) {
-                    if let name = drillDown, let llm = currentLLMs.first(where: { $0.name == name }) {
+                    if let name = drillDown, let llm = (currentLLMs + apiCards).first(where: { $0.name == name }) {
                         detailPage(for: llm)
                     } else {
                         switch tab {
@@ -738,6 +792,8 @@ public struct DashboardView: View {
                        isOn: Binding(get: { autoCleanOn }, set: { autoCleanOn = $0; actions.setAutoClean($0) }))
             settingRow("登录时自动启动", detail: "随 macOS 登录常驻菜单栏",
                        isOn: Binding(get: { launchAtLoginOn }, set: { launchAtLoginOn = $0; actions.setLaunchAtLogin($0) }))
+            settingRow("阈值通知", detail: "额度 80/95%、内存 85/93%、磁盘 90/96% 越线时提醒一次",
+                       isOn: Binding(get: { notifyOn }, set: { notifyOn = $0; actions.setThresholdNotify($0) }))
         }
         .padding(10)
         .background(Color.secondary.opacity(0.06))
@@ -1061,6 +1117,12 @@ public struct DashboardView: View {
                 Text(llm.extraLine)
                     .font(.system(size: 7.5))
                     .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            if !llm.extraLine2.isEmpty {
+                Text(llm.extraLine2)
+                    .font(.system(size: 7.5))
+                    .foregroundColor(llm.extraLine2.contains("错") ? .orange : .secondary)
                     .lineLimit(1)
             }
             subQuotaRows(for: llm)

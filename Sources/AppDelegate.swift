@@ -229,12 +229,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return img
     }
 
+    /// 图标仍然只画内存可用 %（不掺额度，免得菜单栏变成花的）。
+    /// 压力信号只走两条出口：越线弹通知 + 悬停 tooltip 里列全部。
     private func renderStatusButton(report: ScanReport) {
         guard let button = statusItem.button else { return }
         button.image = renderChipFrameImage(percentage: report.freePercentage)
         button.imagePosition = .imageOnly
         button.title = ""
         button.attributedTitle = NSAttributedString(string: "")
+
+        let signals = report.pressures
+        button.toolTip = (["VibeGauge · 内存可用 \(report.freePercentage)%", "—— 以下为已用 %（越高越紧）——"]
+                          + signals.prefix(8).map { "\($0.short)  \($0.pct)%" + ($0.level > 0 ? "  ⚠︎" : "") }).joined(separator: "\n")
+        evaluateThresholds(signals)
+    }
+
+    // MARK: - 阈值通知
+    // 每次扫描（8s）都评一遍，靠"同键同级只报一次"去重；掉回警告线下 5 点才解除，避免在阈值上来回抖。
+    // ponytail: 状态只在内存里，重启 App 会重报一次，够用；要持久化再挪 UserDefaults
+    private var notifiedLevel: [String: Int] = [:]
+    private let notifyKey = "thresholdNotifyEnabled"
+
+    var isThresholdNotifyEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: notifyKey) == nil ? true : UserDefaults.standard.bool(forKey: notifyKey) }
+        set { UserDefaults.standard.set(newValue, forKey: notifyKey) }
+    }
+
+    private func evaluateThresholds(_ signals: [PressureSignal]) {
+        let live = Set(signals.map { $0.key })
+        notifiedLevel = notifiedLevel.filter { live.contains($0.key) }   // 额度换窗口 → 键变了 → 旧状态丢掉
+        guard isThresholdNotifyEnabled else { return }
+
+        for s in signals {
+            let last = notifiedLevel[s.key] ?? 0
+            if s.level > last {
+                notifiedLevel[s.key] = s.level
+                sendNotification(
+                    title: (s.level >= 2 ? "⛔️ " : "⚠️ ") + "\(s.short) \(s.pct)%",
+                    body: s.detail
+                )
+            } else if s.level == 0, last > 0, s.pct < s.warn - 5 {
+                notifiedLevel[s.key] = 0
+            }
+        }
     }
 
     // MARK: - NSMenuDelegate (嵌入 SwiftUI 面板)
@@ -257,6 +294,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         actions.rescan = { [weak self] in self?.updateStatus() }
         actions.setAutoClean = { [weak self] on in self?.isAutoCleanEnabled = on }
         actions.setLaunchAtLogin = { [weak self] on in self?.setLaunchAtLogin(on) }
+        actions.setThresholdNotify = { [weak self] on in self?.isThresholdNotifyEnabled = on }
         actions.installProxy = { [weak self] in
             self?.menu.cancelTracking()
             self?.installProxy()
@@ -270,7 +308,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let dashboard = DashboardView(
             report: report,
-            settings: PanelSettings(autoClean: isAutoCleanEnabled, launchAtLogin: isLaunchAtLoginEnabled()),
+            settings: PanelSettings(autoClean: isAutoCleanEnabled,
+                                    launchAtLogin: isLaunchAtLoginEnabled(),
+                                    thresholdNotify: isThresholdNotifyEnabled),
             actions: actions
         )
 
