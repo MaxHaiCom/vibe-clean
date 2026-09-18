@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-VibeClean API 记账代理 —— 纯 stdlib，Python ≥ 3.9（/usr/bin/python3 即可），零依赖。
+VibeGauge API 记账代理 —— 纯 stdlib，Python ≥ 3.9（/usr/bin/python3 即可），零依赖。
 
 用法（上游写在路径里，零配置）：
   ANTHROPIC_BASE_URL=http://127.0.0.1:18790/https://open.bigmodel.cn/api/anthropic
   OPENAI_BASE_URL=http://127.0.0.1:18790/https://api.deepseek.com/v1
   → 请求 /https://HOST/任意路径 原样转发到 HOST，响应流式透传，同时从响应里抠 model + usage 记账。
 
-产物（目录 ~/.config/vibeclean/）：
+产物（目录 ~/.config/vibegauge/）：
   api-calls.jsonl   每次调用一行：ts/host/provider/model/ctx/cache_read/cache_write/out/think/status/ms
   api-quota.json    各上游的额度/余额（代理从请求头看到 key，只放内存，定时查厂商用量接口）
-  GET /_vibeclean/health   运行状态
+  GET /_vibegauge/health   运行状态
 
-自测：python3 vibeclean-proxy.py --selftest（本地起假上游，验证流式/非流式解析）
+自测：python3 vibegauge-proxy.py --selftest（本地起假上游，验证流式/非流式解析）
 """
 import gzip
 import hashlib
@@ -26,11 +26,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
-PORT = int(os.environ.get("VIBECLEAN_PROXY_PORT", "18790"))
-DIR = os.path.expanduser(os.environ.get("VIBECLEAN_DIR", "~/.config/vibeclean"))
+PORT = int(os.environ.get("VIBEGAUGE_PROXY_PORT", "18790"))
+DIR = os.path.expanduser(os.environ.get("VIBEGAUGE_DIR", "~/.config/vibegauge"))
 CALLS = os.path.join(DIR, "api-calls.jsonl")
 QUOTA = os.path.join(DIR, "api-quota.json")
-QUOTA_INTERVAL = int(os.environ.get("VIBECLEAN_QUOTA_INTERVAL", "300"))
+QUOTA_INTERVAL = int(os.environ.get("VIBEGAUGE_QUOTA_INTERVAL", "300"))
 START = time.time()
 
 # host 子串 → 展示名
@@ -188,7 +188,7 @@ def parse_usage(req_model: Optional[str], content_type: str, body: bytes, encodi
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "VibeCleanProxy/1"
+    server_version = "VibeGaugeProxy/1"
 
     def log_message(self, fmt, *args):  # 安静
         pass
@@ -224,7 +224,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length else b""
 
     def _proxy(self) -> None:
-        if self.path.startswith("/_vibeclean/health"):
+        if self.path.startswith("/_vibegauge/health"):
             with _lock:
                 return self._json(200, {"ok": True, "port": PORT, "uptime_s": int(time.time() - START),
                                         "calls": _stats["calls"], "parsed": _stats["parsed"], "errors": _stats["errors"],
@@ -275,7 +275,7 @@ class Handler(BaseHTTPRequestHandler):
                     _stats["calls"] += 1
                     _stats["errors"] += 1
                 append_call(rec)
-            return self._json(502, {"error": "vibeclean-proxy upstream error: %s" % e})
+            return self._json(502, {"error": "vibegauge-proxy upstream error: %s" % e})
 
         clen = resp.getheader("Content-Length")
         chunked = clen is None
@@ -342,7 +342,7 @@ class Handler(BaseHTTPRequestHandler):
 def _get_json(host: str, path: str, headers: Dict[str, str], timeout: int = 15) -> Any:
     conn = http.client.HTTPSConnection(host, timeout=timeout)
     try:
-        conn.request("GET", path, headers=dict(headers, **{"Accept": "application/json", "User-Agent": "VibeClean/1"}))
+        conn.request("GET", path, headers=dict(headers, **{"Accept": "application/json", "User-Agent": "VibeGauge/1"}))
         r = conn.getresponse()
         raw = r.read()
         if r.status >= 400:
@@ -512,7 +512,7 @@ def selftest() -> None:
     import socketserver
     import tempfile
     global DIR, CALLS, QUOTA
-    DIR = tempfile.mkdtemp(prefix="vibeclean-selftest-")
+    DIR = tempfile.mkdtemp(prefix="vibegauge-selftest-")
     CALLS, QUOTA = os.path.join(DIR, "api-calls.jsonl"), os.path.join(DIR, "api-quota.json")
 
     class Mock(BaseHTTPRequestHandler):
@@ -567,7 +567,7 @@ def selftest() -> None:
               headers={"Content-Type": "application/json", "Authorization": "Bearer test"})
     r = c.getresponse()
     assert r.status == 200 and json.loads(r.read())["usage"]["prompt_tokens"] == 100
-    c.request("GET", "/_vibeclean/health")
+    c.request("GET", "/_vibegauge/health")
     h = json.loads(c.getresponse().read())
     assert h["ok"] and h["calls"] == 2 and h["parsed"] == 2, h
     c.request("GET", "/nonsense")
@@ -593,7 +593,7 @@ def main() -> None:
     threading.Thread(target=quota_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     srv.daemon_threads = True
-    print("vibeclean-proxy listening on 127.0.0.1:%d, dir=%s" % (PORT, DIR), flush=True)
+    print("vibegauge-proxy listening on 127.0.0.1:%d, dir=%s" % (PORT, DIR), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

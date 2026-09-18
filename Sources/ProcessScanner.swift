@@ -3,6 +3,24 @@ import os
 
 // MARK: - 数据模型
 
+/// 一个候选孤儿进程：带完整命令行，供杀之前核对与在面板上预览
+public struct OrphanProc: Identifiable {
+    public var id: Int { pid }
+    public let pid: Int
+    public let cmd: String
+    public let memMB: Double
+    public let service: String
+}
+
+/// 被规则放过的进程 + 放过的原因（面板上要能说清"为什么没动它"）
+public struct ProtectedProc: Identifiable {
+    public var id: Int { pid }
+    public let pid: Int
+    public let cmd: String
+    public let memMB: Double
+    public let reason: String
+}
+
 public struct ServiceGroup: Identifiable {
     public var id: String { serviceName }
     public let serviceName: String
@@ -170,6 +188,8 @@ public struct ScanReport {
 
     // 断链孤儿
     public var orphanedGroups: [ServiceGroup] = []
+    public var orphans: [OrphanProc] = []
+    public var protected: [ProtectedProc] = []
     public var allOrphanPids: [Int] = []
     public var totalOrphanCount: Int = 0
     public var totalOrphanMemMB: Double = 0.0
@@ -267,7 +287,7 @@ public final class ProcessScanner {
     public static let shared = ProcessScanner()
 
     private let lock = NSRecursiveLock()
-    private let log = Logger(subsystem: "com.haifeng.vibeclean", category: "scan")
+    private let log = Logger(subsystem: "com.haifeng.vibegauge", category: "scan")
     private let home = FileManager.default.homeDirectoryForCurrentUser.path
     private let env = ProcessInfo.processInfo.environment
 
@@ -285,6 +305,38 @@ public final class ProcessScanner {
     // 缓存：贵操作节流
     private var npxCache: (mb: Double, at: TimeInterval)? = nil
     private var ollamaCache: (count: Int, sub: String, at: TimeInterval)? = nil
+
+    /// 由 launchd 托管的常驻服务：ppid 天然是 1，但它们是「该活着的」，绝不能当孤儿杀。
+    /// 从 plist 的 Program / ProgramArguments 里取出非解释器的实参当特征（取解释器路径会保护掉所有 python/node，太宽）。
+    private var launchdCache: (at: TimeInterval, tokens: [(token: String, label: String)])? = nil
+    private let interpreters: Set<String> = ["python", "python3", "node", "bun", "deno", "ruby", "perl", "sh", "bash", "zsh", "env", "uvx", "npx", "uv", "npm", "pnpm", "yarn", "open", "osascript"]
+
+    private func launchdProtectedTokens() -> [(token: String, label: String)] {
+        let now = Date().timeIntervalSince1970
+        if let c = launchdCache, now - c.at < 300 { return c.tokens }
+        var out: [(String, String)] = []
+        let fm = FileManager.default
+        let dirs = ["\(home)/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/LaunchDaemons"]
+        for dir in dirs {
+            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for n in names where n.hasSuffix(".plist") {
+                guard let data = try? Data(contentsOf: URL(fileURLWithPath: "\(dir)/\(n)")),
+                      let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else { continue }
+                let label = plist["Label"] as? String ?? n
+                var args: [String] = []
+                if let prog = plist["Program"] as? String { args.append(prog) }
+                if let pa = plist["ProgramArguments"] as? [String] { args.append(contentsOf: pa) }
+                for a in args {
+                    let base = String(a.split(separator: "/").last ?? "")
+                    if a.hasPrefix("-") || base.isEmpty || interpreters.contains(base) { continue }
+                    if a.count < 6 { continue }              // 太短的实参当特征会误伤
+                    out.append((a, label))
+                }
+            }
+        }
+        launchdCache = (now, out)
+        return out
+    }
 
     private let whitelist = [
         "CleanMyMac", "figma-agent-bridge", "tailscale", "docker", "com.docker",
@@ -572,13 +624,29 @@ public final class ProcessScanner {
             }
         }
 
-        // 9. 孤儿：ppid==1 + 无监听端口 + 非白名单 + runner + MCP 签名
+        // 9. 孤儿：ppid==1 + 无监听端口 + 非白名单 + 非 launchd 托管 + runner + MCP 签名
+        //    放过的都记下原因，面板要能解释"为什么没动它"
+        let launchdTokens = launchdProtectedTokens()
         var orphanRoots = Set<Int>()
-        for (pid, p) in procs where p.ppid == 1 && !listeningPids.contains(pid) {
-            if whitelist.contains(where: { p.cmd.contains($0) }) { continue }
+        var protectedList: [ProtectedProc] = []
+        for (pid, p) in procs where p.ppid == 1 {
             let lower = p.cmd.lowercased()
-            if isRunner(lower) && allKeywords.contains(where: { lower.contains($0) }) { orphanRoots.insert(pid) }
+            guard isRunner(lower), allKeywords.contains(where: { lower.contains($0) }) else { continue }
+            if listeningPids.contains(pid) {
+                protectedList.append(ProtectedProc(pid: pid, cmd: p.cmd, memMB: p.memMB, reason: "在监听端口（可能还有客户端会连）"))
+                continue
+            }
+            if let hit = whitelist.first(where: { p.cmd.contains($0) }) {
+                protectedList.append(ProtectedProc(pid: pid, cmd: p.cmd, memMB: p.memMB, reason: "白名单：\(hit)"))
+                continue
+            }
+            if let hit = launchdTokens.first(where: { p.cmd.contains($0.token) }) {
+                protectedList.append(ProtectedProc(pid: pid, cmd: p.cmd, memMB: p.memMB, reason: "launchd 托管：\(hit.label)"))
+                continue
+            }
+            orphanRoots.insert(pid)
         }
+        report.protected = protectedList.sorted { $0.memMB > $1.memMB }
         var allOrphans = orphanRoots
         var stack = Array(orphanRoots)
         while let curr = stack.popLast() {
@@ -600,6 +668,12 @@ public final class ProcessScanner {
         }
         report.orphanedGroups = groupMap.map { ServiceGroup(serviceName: $0.key, processCount: $0.value.count, totalMemMB: $0.value.mem, pids: $0.value.pids) }
             .sorted { $0.totalMemMB > $1.totalMemMB }
+        report.orphans = allOrphans.compactMap { pid -> OrphanProc? in
+            guard let p = procs[pid] else { return nil }
+            let lower = p.cmd.lowercased()
+            let name = serviceDefinitions.first(where: { lower.contains($0.key) })?.name ?? "其他已退出 AI 进程"
+            return OrphanProc(pid: pid, cmd: p.cmd, memMB: p.memMB, service: name)
+        }.sorted { $0.memMB > $1.memMB }
         report.allOrphanPids = Array(allOrphans)
         report.totalOrphanCount = allOrphans.count
         report.totalOrphanMemMB = report.orphanedGroups.reduce(0.0) { $0 + $1.totalMemMB }
@@ -774,7 +848,7 @@ public final class ProcessScanner {
     private let remoteLock = NSLock()
     private var remoteCodex: (at: TimeInterval, ok: Bool, parsed: CodexParse) = (0, false, CodexParse())
     /// 另一台真正跑 Codex 的机器（默认空 = 关闭远程合并）。
-    /// 开启：`defaults write com.haifeng.vibeclean codexRemoteHost <ssh-host>`，该 host 需能免密 ssh。
+    /// 开启：`defaults write com.haifeng.vibegauge codexRemoteHost <ssh-host>`，该 host 需能免密 ssh。
     public var codexRemoteHost: String {
         (UserDefaults.standard.string(forKey: "codexRemoteHost") ?? "").trimmingCharacters(in: .whitespaces)
     }
@@ -1426,13 +1500,50 @@ public final class ProcessScanner {
 
     // MARK: 清理动作
 
-    /// 先 SIGTERM，300ms 后仍存活的补 SIGKILL。返回实际发信号的进程数。
-    public func killProcesses(pids: [Int]) -> Int {
-        if pids.isEmpty { return 0 }
-        for pid in pids { kill(pid_t(pid), SIGTERM) }
+    // 连续两次扫描都在、且已孤儿 minSeconds 以上，才允许静默清理
+    private var orphanFirstSeen: [Int: (at: TimeInterval, cmd: String)] = [:]
+
+    public func stableOrphans(_ orphans: [OrphanProc], minSeconds: Double) -> [OrphanProc] {
+        lock.lock(); defer { lock.unlock() }
+        let now = Date().timeIntervalSince1970
+        var next: [Int: (at: TimeInterval, cmd: String)] = [:]
+        var out: [OrphanProc] = []
+        for o in orphans {
+            if let prev = orphanFirstSeen[o.pid], prev.cmd == o.cmd {
+                next[o.pid] = prev
+                if now - prev.at >= minSeconds { out.append(o) }
+            } else {
+                next[o.pid] = (now, o.cmd)      // 第一次见到，这轮不动它
+            }
+        }
+        orphanFirstSeen = next
+        return out
+    }
+
+    /// 按「快照里记下的命令行」逐个复核后再杀。
+    /// 面板上的快照最多 8 秒前，而 macOS 的 pid 会回绕复用 —— 直接按旧 pid 开枪有可能打到刚起来的别的进程。
+    /// 复核：pid 仍存在、ppid 仍为 1、命令行与快照一致；任一不符就跳过。
+    /// 先 SIGTERM，300ms 后仍存活的补 SIGKILL。
+    public func killProcesses(_ targets: [OrphanProc]) -> (killed: Int, skipped: Int, freedMB: Double) {
+        if targets.isEmpty { return (0, 0, 0) }
+        lock.lock()
+        let live = readProcs()
+        lock.unlock()
+
+        var confirmed: [OrphanProc] = []
+        var skipped = 0
+        for t in targets {
+            guard let p = live[t.pid], p.ppid == 1, p.cmd == t.cmd else {
+                skipped += 1
+                log.notice("kill skipped pid=\(t.pid) (已消失或 pid 被复用)")
+                continue
+            }
+            confirmed.append(t)
+        }
+        for t in confirmed { kill(pid_t(t.pid), SIGTERM) }
         usleep(300_000)
-        for pid in pids where kill(pid_t(pid), 0) == 0 { kill(pid_t(pid), SIGKILL) }
-        return pids.count
+        for t in confirmed where kill(pid_t(t.pid), 0) == 0 { kill(pid_t(t.pid), SIGKILL) }
+        return (confirmed.count, skipped, confirmed.reduce(0.0) { $0 + $1.memMB })
     }
 
     public func cleanNPXCache() -> Double {

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-APP_NAME="VibeClean"
+APP_NAME="VibeGauge"
 APP_BUNDLE="${APP_NAME}.app"
 BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -29,7 +29,7 @@ mkdir -p "${APP_BUNDLE}/Contents/Resources"
 
 mv "${APP_NAME}" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
 cp Resources/Info.plist "${APP_BUNDLE}/Contents/Info.plist"
-cp Resources/vibeclean-proxy.py "${APP_BUNDLE}/Contents/Resources/vibeclean-proxy.py"
+cp Resources/vibegauge-proxy.py "${APP_BUNDLE}/Contents/Resources/vibegauge-proxy.py"
 if [ -f Resources/AppIcon.icns ]; then
     cp Resources/AppIcon.icns "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
 fi

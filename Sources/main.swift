@@ -1,6 +1,6 @@
 import Cocoa
 
-// `VibeClean --install-proxy` / `--uninstall-proxy`：命令行装卸 API 记账代理（与菜单同一条代码路径）
+// `VibeGauge --install-proxy` / `--uninstall-proxy`：命令行装卸 API 记账代理（与菜单同一条代码路径）
 if CommandLine.arguments.contains("--install-proxy") {
     do {
         try ProxyManager.shared.install()
@@ -17,7 +17,7 @@ if CommandLine.arguments.contains("--uninstall-proxy") {
     exit(0)
 }
 
-// `VibeClean --selftest`：不起 UI，校验纯函数 + 打印一次完整扫描结果（档位/额度/Token 去重后数据）
+// `VibeGauge --selftest`：不起 UI，校验纯函数 + 打印一次完整扫描结果（档位/额度/Token 去重后数据）
 if CommandLine.arguments.contains("--selftest") {
     precondition(Fmt.modelDisplayName("claude-fable-5-1") == "Fable 5.1")
     precondition(Fmt.modelDisplayName("claude-opus-5") == "Opus 5")
@@ -55,6 +55,12 @@ if CommandLine.arguments.contains("--selftest") {
     print(String(format: "内存 可用%d%%  已用 %.1f/%.1f GB  swap %.2f GB  压缩 %.2f GB", r.freePercentage, r.usedMemoryGB, r.totalMemoryGB, r.swapUsedGB, r.compressorGB))
     print(String(format: "磁盘 剩余 %.1f/%.1f GB  负载 %.2f  NPX %.0f MB  MCP %d 进程 %.0f MB", r.diskFreeGB, r.diskTotalGB, r.loadAvg1m, r.npxCacheMB, r.activeMCPProcessCount, r.activeMCPTotalMemMB))
     print("孤儿 \(r.totalOrphanCount) 个 \(Int(r.totalOrphanMemMB)) MB: " + r.orphanedGroups.map { "\($0.serviceName)x\($0.processCount)" }.joined(separator: ", "))
+    if !r.orphans.isEmpty || !r.protected.isEmpty {
+        print("--- 会被清理的（逐条）---")
+        for o in r.orphans { print(String(format: "  pid %-7d %5.0f MB  %@", o.pid, o.memMB, String(o.cmd.prefix(90)))) }
+        print("--- 规则放过的（原因）---")
+        for p in r.protected { print(String(format: "  pid %-7d %5.0f MB  [%@]  %@", p.pid, p.memMB, p.reason, String(p.cmd.prefix(70)))) }
+    }
     print("--- 平台 ---")
     func w(_ label: String, _ q: QuotaWindow?) -> String {
         guard let q = q else { return "" }

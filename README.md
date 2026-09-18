@@ -1,4 +1,4 @@
-# VibeClean 🧠
+# VibeGauge 🧠
 
 专为 **Vibe Coding** 打造的极简 macOS 菜单栏原生监控与清理工具（纯 Swift + AppKit + SwiftUI，无第三方依赖）。
 
@@ -26,7 +26,7 @@
 | 平台 | 档位 | 额度 | 新鲜度 |
 |------|------|------|--------|
 | Claude | `~/.claude.json` → `oauthAccount.organizationRateLimitTier`（`default_claude_max_5x` → Max 5x / `max_20x` → Max 20x / pro / team） | `~/.claude/claude-usage.json`（statusline 截获 Claude Code 下发的整个 `rate_limits`：`five_hour` / `seven_day` 的 `used_percentage` + `resets_at`）。Claude Code 目前**不下发按模型的窗口**（无 Fable/Opus 独立桶）；若将来出现如 `seven_day_fable` 键，自动当副池显示 | `_captured_at` |
-| Codex | `~/.codex/auth.json` id_token JWT → `chatgpt_plan_type`（`prolite` → Pro Lite / plus / pro / team） | 会话 jsonl 的 `rate_limits` **按 `limit_id` 分桶**：只显示主桶 `codex`（新版 CLI 另报的 `codex_bengalfox`/Spark 等桶解析但不显示，免得被误当主桶）→ 取采集时间最新的一条。来源 = 本机 `~/.codex/sessions`（近 7 天目录、48h 内改过）**+ 可选远程主机 ssh 拉取**（默认关闭；`defaults write com.haifeng.vibeclean codexRemoteHost <ssh-host>` 开启，60s 一次，需免密 ssh），两边按采集时间合并 | 该行 `timestamp` |
+| Codex | `~/.codex/auth.json` id_token JWT → `chatgpt_plan_type`（`prolite` → Pro Lite / plus / pro / team） | 会话 jsonl 的 `rate_limits` **按 `limit_id` 分桶**：只显示主桶 `codex`（新版 CLI 另报的 `codex_bengalfox`/Spark 等桶解析但不显示，免得被误当主桶）→ 取采集时间最新的一条。来源 = 本机 `~/.codex/sessions`（近 7 天目录、48h 内改过）**+ 可选远程主机 ssh 拉取**（默认关闭；`defaults write com.haifeng.vibegauge codexRemoteHost <ssh-host>` 开启，60s 一次，需免密 ssh），两边按采集时间合并 | 该行 `timestamp` |
 | Gemini（Antigravity） | 本地没有套餐字段；新版 agy 连 token 文件也不落盘 → 有 token 文件显示鉴权方式，否则能拉到额度即 "已登录" | `~/.cache/agy-hud/quota_cache.json`（`gemini` 池 + `3p` 三方池，`remaining_fraction` + `reset_at`） | 每个池各自的 `recorded_at`，脚注分别标 |
 | Grok | `~/.grok/settings_cache.json` → `subscription_tier_display` 原值 | `~/.grok/logs/unified.jsonl` 最后一条 `billing: fetched credits config`（`creditUsagePercent` = 周额度已用 %，`currentPeriod.end` = 重置点；grok 跑着时每几分钟记一次） | 该行 `ts` |
 | Ollama / LM Studio / Cursor | 只探测进程在线 | 无 | — |
@@ -57,7 +57,7 @@ Token 统计规则：
 
 CLI 会话日志只覆盖 Claude Code / Codex / agy / grok 自己的调用。任何程序拿 **API key** 直接打 API（Claude Code 接国内模型、脚本、Hermes…）要看到模型 / 上下文 / token，走内置的**记账代理**：
 
-- 代理 = `Resources/vibeclean-proxy.py`（纯 stdlib Python，`/usr/bin/python3` 即可，零依赖）。菜单「安装 API 记账代理」→ 拷到 `~/.config/vibeclean/`，注册 LaunchAgent `com.haifeng.vibeclean.proxy`（登录自启、崩溃自拉，不依赖 VibeClean 存活），监听 `127.0.0.1:18790`。命令行等价：`VibeClean --install-proxy` / `--uninstall-proxy`。
+- 代理 = `Resources/vibegauge-proxy.py`（纯 stdlib Python，`/usr/bin/python3` 即可，零依赖）。菜单「安装 API 记账代理」→ 拷到 `~/.config/vibegauge/`，注册 LaunchAgent `com.haifeng.vibegauge.proxy`（登录自启、崩溃自拉，不依赖 VibeGauge 存活），监听 `127.0.0.1:18790`。命令行等价：`VibeGauge --install-proxy` / `--uninstall-proxy`。
 - **零配置**：上游写在路径里。别名里的 BASE_URL 前面加代理前缀即可：
   ```bash
   ANTHROPIC_BASE_URL=http://127.0.0.1:18790/https://open.bigmodel.cn/api/anthropic   # GLM
@@ -66,7 +66,7 @@ CLI 会话日志只覆盖 Claude Code / Codex / agy / grok 自己的调用。任
   perl -pi.bak -e 's#(ANTHROPIC_BASE_URL=["\x27]?)(?!http://127\.0\.0\.1:18790/)(https?://)#$1http://127.0.0.1:18790/$2#' ~/.zshrc
   ```
   订阅版 Claude Code（`cc`，无 BASE_URL）不要走它——它的用量已在会话日志里，而且它用 HTTPS_PROXY 出网，代理不转发这个环境变量。
-- **记账**：每次 POST 一行 `~/.config/vibeclean/api-calls.jsonl`（`ts/host/provider/model/ctx/cache_read/cache_write/out/think/status/ms`）。**不落 key**：只记 key 的 SHA-256 前 8 位指纹用于区分多个 key，请求路径的 query string 一律抹掉（Gemini 那种 `?key=` 在 URL 里的写法不会进文件）。流式也解析：Anthropic `message_start`+`message_delta`、OpenAI 最后一个带 `usage` 的 chunk、Gemini `usageMetadata`、Ollama 原生。响应原样流式透传，客户端无感。
+- **记账**：每次 POST 一行 `~/.config/vibegauge/api-calls.jsonl`（`ts/host/provider/model/ctx/cache_read/cache_write/out/think/status/ms`）。**不落 key**：只记 key 的 SHA-256 前 8 位指纹用于区分多个 key，请求路径的 query string 一律抹掉（Gemini 那种 `?key=` 在 URL 里的写法不会进文件）。流式也解析：Anthropic `message_start`+`message_delta`、OpenAI 最后一个带 `usage` 的 chunk、Gemini `usageMetadata`、Ollama 原生。响应原样流式透传，客户端无感。
 - **额度 / 余额**：代理从请求头看到各上游的 key（只在内存，不落盘），每 5 分钟查一次厂商用量接口，写 `api-quota.json`：
 
   | 厂商 | 接口 | 状态 |
@@ -80,19 +80,19 @@ CLI 会话日志只覆盖 Claude Code / Codex / agy / grok 自己的调用。任
   | 火山方舟 coding / 小米 MiMo / xAI 推理 key | 无公开接口（实测 404 / 需云账号 AK/SK 或管理 key） | 只记调用 |
 
 - 面板「API Key 调用」：每个上游一张卡，档位显示套餐（如 `Coding Lite`）或 `API Key`，5H/W 额度条或余额，今日调用次数 + 模型 + 上下文/输出/缓存命中。
-- 自测：`/usr/bin/python3 Resources/vibeclean-proxy.py --selftest`（本地假上游，验证流式/非流式解析）。
+- 自测：`/usr/bin/python3 Resources/vibegauge-proxy.py --selftest`（本地假上游，验证流式/非流式解析）。
 
 ## 编译与启动
 
 ```bash
-git clone https://github.com/MaxHaiCom/vibe-clean.git
-cd vibe-clean
+git clone https://github.com/MaxHaiCom/vibe-gauge.git
+cd vibe-gauge
 ./build.sh                     # swiftc 直接编译 + 打包 + ad-hoc 签名，无需 Xcode 工程
-open VibeClean.app
+open VibeGauge.app
 
 # 不起 UI，校验纯函数并打印一次完整扫描（档位/额度/Token/API 代理）
-./VibeClean.app/Contents/MacOS/VibeClean --selftest
-./VibeClean.app/Contents/MacOS/VibeClean --install-proxy     # 装/起 API 记账代理（LaunchAgent）
+./VibeGauge.app/Contents/MacOS/VibeGauge --selftest
+./VibeGauge.app/Contents/MacOS/VibeGauge --install-proxy     # 装/起 API 记账代理（LaunchAgent）
 ```
 
 > 若安装了 Bartender 等菜单栏管理工具，新图标可能默认被收进折叠区。

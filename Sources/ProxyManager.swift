@@ -1,16 +1,16 @@
 import Foundation
 
-/// API 记账代理的安装 / 状态。代理本体是 Resources/vibeclean-proxy.py（纯 stdlib Python），
-/// 安装时拷到 ~/.config/vibeclean/ 并注册 LaunchAgent（登录自启、崩溃自拉），不依赖 VibeClean 存活。
+/// API 记账代理的安装 / 状态。代理本体是 Resources/vibegauge-proxy.py（纯 stdlib Python），
+/// 安装时拷到 ~/.config/vibegauge/ 并注册 LaunchAgent（登录自启、崩溃自拉），不依赖 VibeGauge 存活。
 final class ProxyManager {
     static let shared = ProxyManager()
 
     let port = 18790
-    let label = "com.haifeng.vibeclean.proxy"
+    let label = "com.haifeng.vibegauge.proxy"
     private let home = FileManager.default.homeDirectoryForCurrentUser.path
 
-    var dir: String { "\(home)/.config/vibeclean" }
-    var scriptPath: String { "\(dir)/vibeclean-proxy.py" }
+    var dir: String { "\(home)/.config/vibegauge" }
+    var scriptPath: String { "\(dir)/vibegauge-proxy.py" }
     var callsPath: String { "\(dir)/api-calls.jsonl" }
     var quotaPath: String { "\(dir)/api-quota.json" }
     var logPath: String { "\(dir)/proxy.log" }
@@ -29,7 +29,7 @@ final class ProxyManager {
 
     /// 同步探活，超时 0.4s；nil = 没在跑
     func health() -> Health? {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/_vibeclean/health") else { return nil }
+        guard let url = URL(string: "http://127.0.0.1:\(port)/_vibegauge/health") else { return nil }
         var req = URLRequest(url: url)
         req.timeoutInterval = 0.4
         var result: Health? = nil
@@ -45,13 +45,13 @@ final class ProxyManager {
         return result
     }
 
-    private var bundledScript: String? { Bundle.main.path(forResource: "vibeclean-proxy", ofType: "py") }
+    private var bundledScript: String? { Bundle.main.path(forResource: "vibegauge-proxy", ofType: "py") }
 
-    /// 把 App 包里的脚本拷到 ~/.config/vibeclean/（内容不同才覆盖），返回是否有更新
+    /// 把 App 包里的脚本拷到 ~/.config/vibegauge/（内容不同才覆盖），返回是否有更新
     @discardableResult
     private func syncScript() throws -> Bool {
         guard let src = bundledScript else {
-            throw NSError(domain: "VibeClean", code: 1, userInfo: [NSLocalizedDescriptionKey: "App 包里没有 vibeclean-proxy.py（build.sh 没拷？）"])
+            throw NSError(domain: "VibeGauge", code: 1, userInfo: [NSLocalizedDescriptionKey: "App 包里没有 vibegauge-proxy.py（build.sh 没拷？）"])
         }
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let new = try Data(contentsOf: URL(fileURLWithPath: src))
@@ -71,7 +71,7 @@ final class ProxyManager {
             <key>ProgramArguments</key>
             <array><string>/usr/bin/python3</string><string>\(scriptPath)</string></array>
             <key>EnvironmentVariables</key>
-            <dict><key>VIBECLEAN_PROXY_PORT</key><string>\(port)</string><key>PYTHONUNBUFFERED</key><string>1</string></dict>
+            <dict><key>VIBEGAUGE_PROXY_PORT</key><string>\(port)</string><key>PYTHONUNBUFFERED</key><string>1</string></dict>
             <key>RunAtLoad</key><true/>
             <key>KeepAlive</key><true/>
             <key>StandardOutPath</key><string>\(logPath)</string>
@@ -84,7 +84,7 @@ final class ProxyManager {
         _ = launchctl(["bootout", "gui/\(getuid())/\(label)"])          // 已有就先卸，忽略失败
         let rc = launchctl(["bootstrap", "gui/\(getuid())", plistPath])
         if rc != 0 {
-            throw NSError(domain: "VibeClean", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: "launchctl bootstrap 失败 rc=\(rc)，看 \(logPath)"])
+            throw NSError(domain: "VibeGauge", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: "launchctl bootstrap 失败 rc=\(rc)，看 \(logPath)"])
         }
     }
 

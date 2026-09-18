@@ -12,7 +12,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var currentReport = ScanReport()
     private weak var hostingView: NSHostingView<DashboardView>?
-    private let log = Logger(subsystem: "com.haifeng.vibeclean", category: "menu")
+    private let log = Logger(subsystem: "com.haifeng.vibegauge", category: "menu")
 
     // UserDefaults Keys
     private let autoCleanKey = "autoCleanEnabled"
@@ -58,13 +58,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func performSilentAutoClean() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let report = ProcessScanner.shared.scan()
-            if !report.allOrphanPids.isEmpty {
-                let killed = ProcessScanner.shared.killProcesses(pids: report.allOrphanPids)
+            // 静默清理更保守：只动「连续两次扫描都是孤儿」的，避开 CLI 正在重启 MCP 的瞬态
+            let stable = ProcessScanner.shared.stableOrphans(report.orphans, minSeconds: 120)
+            if !stable.isEmpty {
+                let r = ProcessScanner.shared.killProcesses(stable)
                 DispatchQueue.main.async {
-                    self?.sendNotification(
-                        title: "VibeClean 内存优化",
-                        body: "已静默清理 \(killed) 个残留 AI 进程，回收 \(String(format: "%.1f", report.totalOrphanMemMB)) MB 内存。"
-                    )
+                    if r.killed > 0 {
+                        self?.sendNotification(
+                            title: "VibeGauge 内存优化",
+                            body: "已静默清理 \(r.killed) 个断链 AI 进程，回收 \(String(format: "%.0f", r.freedMB)) MB 内存。" + (r.skipped > 0 ? "（\(r.skipped) 个已自行退出，跳过）" : "")
+                        )
+                    }
                     self?.updateStatus()
                 }
             }
@@ -213,7 +217,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        let quitItem = NSMenuItem(title: "退出 VibeClean", action: #selector(quitAction), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "退出 VibeGauge", action: #selector(quitAction), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
     }
@@ -234,16 +238,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Actions
     // kill 里有 300ms 等待，rm -rf 走盘：都不在主线程做
     @objc func cleanOrphansAction() {
-        let pids = currentReport.allOrphanPids
-        let memMB = currentReport.totalOrphanMemMB
-        guard !pids.isEmpty else { return }
+        let targets = currentReport.orphans
+        guard !targets.isEmpty else { return }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let killed = ProcessScanner.shared.killProcesses(pids: pids)
+            let r = ProcessScanner.shared.killProcesses(targets)
             DispatchQueue.main.async {
                 self?.sendNotification(
                     title: "清理完成",
-                    body: "已释放 \(killed) 个残留 AI 进程，回收 \(String(format: "%.1f", memMB)) MB 内存。"
+                    body: "已释放 \(r.killed) 个断链 AI 进程，回收 \(String(format: "%.0f", r.freedMB)) MB 内存。" + (r.skipped > 0 ? "（\(r.skipped) 个已自行退出或 pid 变化，已跳过）" : "")
                 )
                 self?.updateStatus()
             }
@@ -278,7 +281,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             ProxyManager.shared.uninstall()
             DispatchQueue.main.async {
-                self?.sendNotification(title: "API 记账代理", body: "已停止并卸载。记账文件保留在 ~/.config/vibeclean/。")
+                self?.sendNotification(title: "API 记账代理", body: "已停止并卸载。记账文件保留在 ~/.config/vibegauge/。")
                 self?.updateStatus()
             }
         }
