@@ -47,6 +47,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
 
+        loadNotifyState()
         DispatchQueue.global(qos: .utility).async { ProxyManager.shared.syncIfInstalled() }   // 包里脚本更新了就热替换
         updateStatus()
 
@@ -246,8 +247,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - 阈值通知
     // 每次扫描（8s）都评一遍，靠"同键同级只报一次"去重；掉回警告线下 5 点才解除，避免在阈值上来回抖。
-    // ponytail: 状态只在内存里，重启 App 会重报一次，够用；要持久化再挪 UserDefaults
+    // 状态落 UserDefaults：不然每次重启 App 都把"本来就满"的池子重报一遍（实测很吵）
     private var notifiedLevel: [String: Int] = [:]
+    private var notifiedAt: [String: TimeInterval] = [:]
+    private var didSeedNotifyState = false
     private let notifyKey = "thresholdNotifyEnabled"
 
     var isThresholdNotifyEnabled: Bool {
@@ -258,20 +261,60 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func evaluateThresholds(_ signals: [PressureSignal]) {
         let live = Set(signals.map { $0.key })
         notifiedLevel = notifiedLevel.filter { live.contains($0.key) }   // 额度换窗口 → 键变了 → 旧状态丢掉
+        notifiedAt = notifiedAt.filter { live.contains($0.key) }
+
+        // 启动后第一轮只建基线，不报：本来就满的池子（如 Gemini 三方）不该在每次开机/重启时再吼一遍。
+        // 之后只有"运行期间真的越线"才提醒。
+        if !didSeedNotifyState {
+            didSeedNotifyState = true
+            let seeded = signals.filter { notifiedLevel[$0.key] == nil }
+            for s in seeded { notifiedLevel[s.key] = s.level }
+            persistNotifyState()
+            log.notice("阈值通知：启动基线 \(signals.count) 条信号，新建 \(seeded.count) 条，本轮不报")
+            return
+        }
+
         guard isThresholdNotifyEnabled else { return }
+        let now = Date().timeIntervalSince1970
+        var dirty = false
 
         for s in signals {
             let last = notifiedLevel[s.key] ?? 0
             if s.level > last {
+                // 同一条信号 4 小时内最多吼一次，避免在阈值上抖来抖去刷屏
+                if now - (notifiedAt[s.key] ?? 0) < Self.notifyCooldown { continue }
                 notifiedLevel[s.key] = s.level
+                notifiedAt[s.key] = now
+                dirty = true
                 sendNotification(
                     title: (s.level >= 2 ? "⛔️ " : "⚠️ ") + "\(s.short) \(s.pct)%",
                     body: s.detail
                 )
             } else if s.level == 0, last > 0, s.pct < s.warn - 5 {
                 notifiedLevel[s.key] = 0
+                dirty = true
             }
         }
+        if dirty { persistNotifyState() }
+    }
+
+    private static let notifyCooldown: TimeInterval = 4 * 3600
+    private let notifyStateKey = "vg.notifyState"       // [key: "level|lastAt"]
+
+    private func loadNotifyState() {
+        guard let raw = UserDefaults.standard.dictionary(forKey: notifyStateKey) as? [String: String] else { return }
+        for (k, v) in raw {
+            let parts = v.split(separator: "|")
+            guard parts.count == 2, let lv = Int(parts[0]), let at = Double(parts[1]) else { continue }
+            notifiedLevel[k] = lv
+            notifiedAt[k] = at
+        }
+    }
+
+    private func persistNotifyState() {
+        var raw: [String: String] = [:]
+        for (k, lv) in notifiedLevel { raw[k] = "\(lv)|\(notifiedAt[k] ?? 0)" }
+        UserDefaults.standard.set(raw, forKey: notifyStateKey)
     }
 
     // MARK: - NSMenuDelegate (嵌入 SwiftUI 面板)
