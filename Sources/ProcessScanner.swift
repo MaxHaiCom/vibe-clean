@@ -139,6 +139,8 @@ public struct DetectedLLMRuntime: Identifiable {
     public var extraLine: String = ""
     /// 卡片第四行（API Key 卡片用：p95 延迟 / 错误率 / 花费）
     public var extraLine2: String = ""
+    /// 额度条下方的口径说明（如"估算 · 本机记账 213 次 / 1200"）—— 估出来的数必须标明
+    public var quotaNote: String = ""
     /// 一个套餐带多个模型各自额度（如 OpenCode Zen）：卡内只显示用得最紧的 3 个，其余折叠
     public var subQuotas: [SubQuota] = []
 
@@ -179,6 +181,9 @@ public struct APIProviderStatus: Identifiable {
     public var monthly: QuotaWindow? = nil
     /// 额度是「本机记账的请求数 ÷ 套餐上限」估的（订阅制 Coding Plan 没有公开用量接口）
     public var quotaIsEstimate: Bool = false
+    /// 估算的底数，要显示给用户看清这数怎么来的："本机记账 213 次 / 1200"
+    public var estimateNote: String = ""
+    public var planLimitText: String = ""
     public var balanceText: String = ""
     public var quotaError: String = ""
     public var cacheHitRate: Double { ctx > 0 ? Double(cacheRead) / Double(ctx) * 100.0 : 0.0 }
@@ -1927,6 +1932,9 @@ public final class ProcessScanner {
                       let ts = stamps[byHost[host]!.provider] else { continue }
                 byHost[host]?.plan = plan.label
                 byHost[host]?.quotaIsEstimate = true
+                let in5h = ts.filter { $0 >= now - 5 * 3600 }.count
+                byHost[host]?.estimateNote = plan.five > 0 ? "本机记账 \(in5h) 次 / \(plan.five)" : "本机记账 \(in5h) 次"
+                byHost[host]?.planLimitText = "5h \(plan.five) · 周 \(plan.weekly) · 月 \(plan.monthly) 次"
                 byHost[host]?.fiveHour = Self.rollingWindow(ts, seconds: 5 * 3600, limit: plan.five, now: now)
                 byHost[host]?.sevenDay = Self.rollingWindow(ts, seconds: 7 * 86400, limit: plan.weekly, now: now)
                 byHost[host]?.monthly = Self.rollingWindow(ts, seconds: 30 * 86400, limit: plan.monthly, now: now)

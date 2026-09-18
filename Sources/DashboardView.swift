@@ -184,6 +184,7 @@ public struct DashboardView: View {
                 name: p.provider, isRunning: nowTS - p.lastTS < 120, tier: p.plan.isEmpty ? "API Key" : p.plan, detail: "\(p.calls) 次",
                 fiveHour: p.fiveHour, sevenDay: p.sevenDay, quotaSubtitle: sub,
                 extraLine: tokens, extraLine2: obs.joined(separator: " · "),
+                quotaNote: p.quotaIsEstimate ? "估算 · " + p.estimateNote : "",
                 platformDetail: apiDetail(p)
             )
         }
@@ -210,6 +211,15 @@ public struct DashboardView: View {
             d.rows.append(("输入 / 输出", "\(formatTokens(p.ctx)) / \(formatTokens(p.out))"))
             d.rows.append(("缓存命中", String(format: "%.0f%%（读 %@）", p.cacheHitRate, formatTokens(p.cacheRead))))
         }
+        if p.quotaIsEstimate {
+            d.rows.append(("额度口径", "估算：本机记账请求数 ÷ 套餐上限"))
+            d.rows.append(("套餐上限", p.planLimitText))
+            d.rows.append(("估算底数", p.estimateNote))
+            d.rows.append(("注意", "走代理之外的调用算不进来，会偏低"))
+        }
+        if let m = p.monthly {
+            d.rows.append(("月窗口", "\(m.effectivePct(now: nowTS))%" + (Fmt.countdown(to: m.resetsAt, now: nowTS).map { " · 重置 \($0)" } ?? "")))
+        }
         if let c = p.cost {
             d.rows.append(("今日花费（估）", money(c, p.costCurrency) + (currentAPI.priceAsOf.isEmpty ? "" : " · 价目表 \(currentAPI.priceAsOf)")))
         } else if p.calls > 0 {
@@ -227,6 +237,7 @@ public struct DashboardView: View {
         }
         d.sourceFiles = ["~/.config/vibegauge/api-calls.jsonl", "~/.config/vibegauge/api-quota.json"]
         if currentAPI.hasPriceTable { d.sourceFiles.append("~/.config/vibegauge/prices.json") }
+        if p.quotaIsEstimate { d.sourceFiles.append("~/.config/vibegauge/plans.json") }
         return d
     }
 
@@ -245,8 +256,12 @@ public struct DashboardView: View {
         return .green
     }
 
+    /// 0% 绿 → 100% 红 连续渐变。平方让曲线后段变色更快：
+    /// 50% 已是黄绿、70% 黄、85% 橙、95%+ 红 —— 旧版"除了 100% 全是绿"没有识别度。
+    /// 饱和度/亮度固定，深浅色模式下都能看清。
     private func quotaColor(_ pct: Int) -> Color {
-        pct >= 100 ? .red : (pct > 80 ? .orange : .green)
+        let p = Double(max(0, min(100, pct))) / 100.0
+        return Color(hue: 0.33 * (1.0 - p * p), saturation: 0.82, brightness: 0.82)
     }
 
     private struct ModelDisplayGroup: Identifiable {
@@ -964,7 +979,7 @@ public struct DashboardView: View {
             MiniProgressBar(value: Double(pct) / 100.0, color: quotaColor(pct), width: 16, height: 3.5)
             Text("\(pct)%")
                 .font(.system(size: 7.5, weight: .bold))
-                .foregroundColor(pct > 80 ? quotaColor(pct) : .primary)
+                .foregroundColor(pct >= 60 ? quotaColor(pct) : .primary)
                 .lineLimit(1)
                 .fixedSize()
             if pct >= 100 {
@@ -1039,7 +1054,7 @@ public struct DashboardView: View {
                         MiniProgressBar(value: Double(pct) / 100.0, color: quotaColor(pct), width: 22, height: 3)
                         Text("\(pct)%")
                             .font(.system(size: 7.5, weight: .bold))
-                            .foregroundColor(pct > 80 ? quotaColor(pct) : .primary)
+                            .foregroundColor(pct >= 60 ? quotaColor(pct) : .primary)
                             .fixedSize()
                     }
                 }
@@ -1107,6 +1122,12 @@ public struct DashboardView: View {
                     }
                 }
                 quotaFooter(for: llm)
+                if !llm.quotaNote.isEmpty {
+                    Text(llm.quotaNote)
+                        .font(.system(size: 7.5))
+                        .foregroundColor(.orange.opacity(0.85))      // 橙色 = 这数是估的，不是厂商给的
+                        .lineLimit(1)
+                }
             } else {
                 Text(llm.quotaSubtitle.isEmpty ? (llm.isRunning ? "服务就绪" : "未启动") : llm.quotaSubtitle)
                     .font(.system(size: 8))
