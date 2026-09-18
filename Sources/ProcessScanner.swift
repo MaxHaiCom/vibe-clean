@@ -41,6 +41,21 @@ public struct TokenStats: Equatable {
     }
 }
 
+/// 某个 CLI 今日自己的用量（各家日志能给多少就给多少，给不了的说明原因）
+public struct CLIUsage: Identifiable {
+    public var id: String { name }
+    public let name: String
+    public var requests: Int = 0
+    public var ctx: Int64 = 0
+    public var cacheRead: Int64 = 0
+    public var out: Int64 = 0
+    public var think: Int64 = 0
+    public var turns: Int = 0
+    public var note: String = ""          // 非空 = 本地拿不到 token，只能给这句说明
+    public var hasTokens: Bool { ctx > 0 || out > 0 }
+    public var cacheHitRate: Double { ctx > 0 ? Double(cacheRead) / Double(ctx) * 100.0 : 0.0 }
+}
+
 /// 一个额度窗口（5h / 周）：已用百分比 + 重置点 + 数据采集时间
 public struct QuotaWindow: Equatable {
     public var usedPct: Int
@@ -146,6 +161,9 @@ public struct ScanReport {
 
     public var tokens: TokenStats = TokenStats()
     public var npxCacheMB: Double = 0.0
+
+    // 各 CLI 今日自己的用量
+    public var cliUsage: [CLIUsage] = []
 
     // API Key 调用（记账代理）
     public var api: ProxyStatus = ProxyStatus()
@@ -590,6 +608,7 @@ public final class ProcessScanner {
         report.tokens = scanTokens()
         report.detectedLLMs = detectAllLLMRuntimes(counts)
         report.api = scanAPI()
+        report.cliUsage = scanCLIUsage(claude: report.tokens)
         return report
     }
 
@@ -1165,6 +1184,111 @@ public final class ProcessScanner {
         }
         s.recentInteractions = Array(all.sorted { $0.timestamp > $1.timestamp }.prefix(3))
         return s
+    }
+
+    // MARK: 各 CLI 今日用量
+
+    private var codexUsageCache: [String: (mtime: TimeInterval, usage: CLIUsage)] = [:]
+
+    /// Codex：`token_count` 事件的 `info.total_token_usage` 是**该会话的累计值** → 每个会话文件取最后一条非空的，再跨文件相加。
+    /// 跨零点的会话会把昨天那部分也算进来（Codex 不按天分账，只能这样近似）。
+    private func codexUsageToday(startOfToday: TimeInterval) -> CLIUsage {
+        var u = CLIUsage(name: "Codex")
+        let fm = FileManager.default
+        let df = DateFormatter()
+        df.dateFormat = "yyyy/MM/dd"
+        var seen = Set<String>()
+        for back in 0...1 {
+            let dir = "\(home)/.codex/sessions/\(df.string(from: Date(timeIntervalSinceNow: -Double(back) * 86400)))"
+            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for n in names where n.hasSuffix(".jsonl") {
+                let path = "\(dir)/\(n)"
+                guard let attrs = try? fm.attributesOfItem(atPath: path),
+                      let mod = attrs[.modificationDate] as? Date else { continue }
+                let mtime = mod.timeIntervalSince1970
+                guard mtime >= startOfToday else { continue }
+                seen.insert(path)
+                let one: CLIUsage
+                if let c = codexUsageCache[path], c.mtime == mtime {
+                    one = c.usage
+                } else {
+                    var acc = CLIUsage(name: "Codex")
+                    let text = readTail(path, maxBytes: 256 * 1024)
+                    let lines = text.components(separatedBy: "\n")
+                    for l in lines.reversed() where l.contains("\"type\":\"token_count\"") && !l.contains("\"info\":null") {
+                        guard let data = l.data(using: .utf8),
+                              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                              let info = findTokenInfo(json),
+                              let t = info["total_token_usage"] as? [String: Any] else { continue }
+                        func n64(_ k: String) -> Int64 { Int64((t[k] as? NSNumber)?.intValue ?? 0) }
+                        acc.ctx = n64("input_tokens")               // 已含 cached
+                        acc.cacheRead = n64("cached_input_tokens")
+                        acc.out = n64("output_tokens")
+                        acc.think = n64("reasoning_output_tokens")
+                        break
+                    }
+                    acc.requests = lines.filter { $0.contains("\"type\":\"token_count\"") && !$0.contains("\"info\":null") }.count
+                    one = acc
+                    codexUsageCache[path] = (mtime, acc)
+                }
+                u.ctx += one.ctx
+                u.cacheRead += one.cacheRead
+                u.out += one.out
+                u.think += one.think
+                u.requests += one.requests
+            }
+        }
+        codexUsageCache = codexUsageCache.filter { seen.contains($0.key) }
+        if !u.hasTokens { u.note = "今日无调用" }
+        return u
+    }
+
+    private func findTokenInfo(_ x: Any) -> [String: Any]? {
+        guard let d = x as? [String: Any] else { return nil }
+        if d["total_token_usage"] != nil { return d }
+        for v in d.values { if let r = findTokenInfo(v) { return r } }
+        return nil
+    }
+
+    /// Grok：`signals.json` 只有 `turnCount` 与当前上下文占用，没有累计 token
+    private func grokUsageToday(startOfToday: TimeInterval) -> CLIUsage {
+        var u = CLIUsage(name: "Grok")
+        let fm = FileManager.default
+        let root = "\(home)/.grok/sessions"
+        guard let dirs = try? fm.contentsOfDirectory(atPath: root) else {
+            u.note = "本地无 token 统计"
+            return u
+        }
+        for d in dirs {
+            guard let subs = try? fm.contentsOfDirectory(atPath: "\(root)/\(d)") else { continue }
+            for sub in subs {
+                let path = "\(root)/\(d)/\(sub)/signals.json"
+                guard let attrs = try? fm.attributesOfItem(atPath: path),
+                      let mod = attrs[.modificationDate] as? Date,
+                      mod.timeIntervalSince1970 >= startOfToday,
+                      let j = readJSON(path) else { continue }
+                u.turns += (j["turnCount"] as? NSNumber)?.intValue ?? 0
+            }
+        }
+        u.note = u.turns > 0 ? "本地无 token 统计，仅轮次" : "今日无调用"
+        return u
+    }
+
+    public func scanCLIUsage(claude: TokenStats) -> [CLIUsage] {
+        lock.lock(); defer { lock.unlock() }
+        let startOfToday = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+        var claudeRow = CLIUsage(name: "Claude Code")
+        claudeRow.requests = claude.todayTurns
+        claudeRow.ctx = claude.todayContext
+        claudeRow.cacheRead = claude.todayCacheRead
+        claudeRow.out = claude.todayOutput
+        claudeRow.think = claude.todayThinking
+        if !claudeRow.hasTokens { claudeRow.note = "今日无调用" }
+
+        var gemini = CLIUsage(name: "Gemini")
+        gemini.note = "本地无 token 统计（额度见上）"      // conversations 是 SQLite，无 token 字段
+
+        return [claudeRow, codexUsageToday(startOfToday: startOfToday), grokUsageToday(startOfToday: startOfToday), gemini]
     }
 
     // MARK: API Key 调用（读记账代理写的 api-calls.jsonl / api-quota.json）

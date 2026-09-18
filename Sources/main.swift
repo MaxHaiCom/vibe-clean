@@ -78,6 +78,15 @@ if CommandLine.arguments.contains("--selftest") {
     for i in t.recentInteractions {
         print(String(format: "  %@ %@  ctx %d  out %d  think %d  hit %.1f%%  [%@]", Fmt.modelDisplayName(i.model), Fmt.ago(Int(now - i.timestamp)), i.contextTokens, i.outputTokens, i.thinkingTokens, i.cacheHitRate, i.id))
     }
+    print("--- 各 CLI 今日用量 ---")
+    for u in r.cliUsage {
+        if u.hasTokens {
+            print(String(format: "  %@: ctx %lld  cache %lld  out %lld  think %lld  %d 次  命中 %.1f%%", u.name, u.ctx, u.cacheRead, u.out, u.think, u.requests, u.cacheHitRate))
+        } else {
+            print("  \(u.name): \(u.turns) 轮 · \(u.note)")
+        }
+    }
+
     let t2 = Date()
     _ = ProcessScanner.shared.scanTokens()
     _ = ProcessScanner.shared.scanActiveLLMs()

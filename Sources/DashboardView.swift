@@ -65,6 +65,7 @@ public struct DashboardView: View {
     @State private var dynamicTokens: TokenStats? = nil
     @State private var dynamicLLMs: [DetectedLLMRuntime]? = nil
     @State private var dynamicAPI: ProxyStatus? = nil
+    @State private var dynamicCLI: [CLIUsage]? = nil
     @State private var refreshing: Bool = false
 
     private let liveTicker = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
@@ -80,6 +81,7 @@ public struct DashboardView: View {
     private var currentTokens: TokenStats { dynamicTokens ?? report.tokens }
     private var currentLLMs: [DetectedLLMRuntime] { dynamicLLMs ?? report.detectedLLMs }
     private var currentAPI: ProxyStatus { dynamicAPI ?? report.api }
+    private var currentCLI: [CLIUsage] { dynamicCLI ?? report.cliUsage }
     private var currentInteractions: [InteractionRecord] { Array(currentTokens.recentInteractions.prefix(3)) }
 
     /// API 上游 → 复用平台卡片：档位 = 套餐名或 "API Key"，额度条 / 余额 / 今日 token 叠加
@@ -168,10 +170,12 @@ public struct DashboardView: View {
             let latestTokens = ProcessScanner.shared.scanTokens()
             let latestLLMs = ProcessScanner.shared.scanActiveLLMs()
             let latestAPI = ProcessScanner.shared.scanAPI()
+            let latestCLI = ProcessScanner.shared.scanCLIUsage(claude: latestTokens)
             DispatchQueue.main.async {
                 self.dynamicTokens = latestTokens
                 self.dynamicLLMs = latestLLMs
                 self.dynamicAPI = latestAPI
+                self.dynamicCLI = latestCLI
                 self.refreshing = false
                 self.actions.relayout()      // 数据到了卡片会增减 → 高度跟着变
             }
@@ -439,7 +443,7 @@ public struct DashboardView: View {
             // 今日 Token 与 Prompt Cache
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
-                    Text("今日上下文")
+                    Text("今日上下文 · Claude Code")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(.secondary)
                     Text(formatTokens(currentTokens.todayContext))
@@ -476,6 +480,45 @@ public struct DashboardView: View {
                     Text("今日 \(currentTokens.todayTurns) 次调用")
                         .font(.system(size: 8.5, weight: .medium))
                         .foregroundColor(.secondary)
+                }
+
+                // 各 CLI 今日用量（各家日志能给多少给多少）
+                if !currentCLI.isEmpty {
+                    Divider().opacity(0.25)
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(currentCLI) { u in
+                            HStack(spacing: 4) {
+                                Text(u.name)
+                                    .font(.system(size: 8, weight: .medium))
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 66, alignment: .leading)
+                                if u.hasTokens {
+                                    Text("上下文 \(formatTokens(u.ctx))")
+                                    Text("·")
+                                    Text("输出 \(formatTokens(u.out))")
+                                    if u.think > 0 {
+                                        Text("·")
+                                        Text("思考 \(formatTokens(u.think))")
+                                    }
+                                    Spacer(minLength: 2)
+                                    if u.ctx > 0 {
+                                        Text(String(format: "命中 %.0f%%", u.cacheHitRate))
+                                            .foregroundColor(u.cacheHitRate >= 80 ? .green : .secondary)
+                                            .fixedSize()
+                                    }
+                                    Text("\(u.requests) 次")
+                                        .fixedSize()
+                                } else {
+                                    Text(u.turns > 0 ? "\(u.turns) 轮 · \(u.note)" : u.note)
+                                        .foregroundColor(.secondary.opacity(0.8))
+                                        .lineLimit(1)
+                                    Spacer(minLength: 2)
+                                }
+                            }
+                            .font(.system(size: 8))
+                            .foregroundColor(.secondary)
+                        }
+                    }
                 }
             }
 
