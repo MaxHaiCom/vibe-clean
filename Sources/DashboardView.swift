@@ -103,6 +103,7 @@ public struct PanelActions {
     public var installProxy: () -> Void = {}
     public var uninstallProxy: () -> Void = {}
     public var copyProxyPrefix: () -> Void = {}
+    public var purgeLogs: () -> Void = {}
     /// Tab 切换后内容高度变了 → 让宿主按新 fittingSize 重排
     public var relayout: () -> Void = {}
     public init() {}
@@ -383,6 +384,7 @@ public struct DashboardView: View {
                         case 2:
                             actionSection
                             hardwareSection
+                            diskSection
                             settingsSection
                         default: aiSection
                         }
@@ -794,6 +796,73 @@ public struct DashboardView: View {
         .padding(10)
         .background(Color.secondary.opacity(0.06))
         .cornerRadius(8)
+    }
+
+    // MARK: - Tab 系统：磁盘占用（会话日志治理）
+
+    private var diskSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("磁盘占用")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text(String(format: "AI 工具目录合计 %.1f GB", report.diskTotalAIGB))
+                    .font(.system(size: 9.5))
+                    .foregroundColor(.secondary)
+            }
+
+            ForEach(report.disk.prefix(6)) { d in
+                HStack(spacing: 5) {
+                    Image(systemName: d.purgeable ? "clock.arrow.circlepath" : "lock")
+                        .font(.system(size: 7.5))
+                        .foregroundColor(d.purgeable ? .blue.opacity(0.8) : .secondary.opacity(0.6))
+                    Text(d.label)
+                        .font(.system(size: 9.5, weight: .medium))
+                        .lineLimit(1)
+                    Spacer()
+                    if d.purgeable, d.oldMB >= 1 {
+                        Text(String(format: "旧 %.0f MB", d.oldMB))
+                            .font(.system(size: 8.5, weight: .semibold))
+                            .foregroundColor(.orange)
+                    }
+                    Text(sizeText(d.totalMB))
+                        .font(.system(size: 9.5))
+                        .foregroundColor(.secondary)
+                        .frame(width: 52, alignment: .trailing)
+                }
+                .help(d.note)
+            }
+
+            if report.purgeableMB >= 100 {
+                Button(action: actions.purgeLogs) {
+                    HStack {
+                        Image(systemName: "trash").font(.system(size: 9))
+                        Text(String(format: "清理 %d 天前的会话记录 · %@", ProcessScanner.shared.logRetentionDays, sizeText(report.purgeableMB)))
+                            .font(.system(size: 10, weight: .semibold))
+                        Spacer()
+                        Text("移入废纸篓").font(.system(size: 8)).foregroundColor(.secondary)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Color.orange.opacity(0.14))
+                    .foregroundColor(.orange)
+                    .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Text("🔒 = 只统计不清理（运行库 / 插件 / 你的产物）")
+                .font(.system(size: 8))
+                .foregroundColor(.secondary)
+        }
+        .padding(10)
+        .background(Color.secondary.opacity(0.06))
+        .cornerRadius(8)
+    }
+
+    private func sizeText(_ mb: Double) -> String {
+        mb >= 1024 ? String(format: "%.2f GB", mb / 1024) : String(format: "%.0f MB", mb)
     }
 
     // MARK: - Tab 系统：设置

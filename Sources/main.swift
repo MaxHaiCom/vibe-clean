@@ -98,6 +98,12 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(ProcessScanner.rollingWindow(stamps, seconds: 3600, limit: 0, now: now) == nil, "没填上限就不估")
     }
 
+    // 会话日志保留期硬下限 7 天（本工具自己要读近两天的文件算额度）
+    precondition(ProcessScanner.effectiveRetention(30) == 30)
+    precondition(ProcessScanner.effectiveRetention(3) == 7)
+    precondition(ProcessScanner.effectiveRetention(0) == 7)
+    precondition(ProcessScanner.effectiveRetention(-99) == 7)
+
     // ssh 主机名会被拼进 shell 命令 → 只放行合法主机名
     precondition(ProcessScanner.isValidSSHHost("mac-mini"))
     precondition(ProcessScanner.isValidSSHHost("user@192.168.1.9"))
@@ -118,6 +124,12 @@ if CommandLine.arguments.contains("--selftest") {
         for o in r.orphans { print(String(format: "  pid %-7d %5.0f MB  %@", o.pid, o.memMB, String(o.cmd.prefix(90)))) }
         print("--- 规则放过的（原因）---")
         for p in r.protected { print(String(format: "  pid %-7d %5.0f MB  [%@]  %@", p.pid, p.memMB, p.reason, String(p.cmd.prefix(70)))) }
+    }
+    print(String(format: "--- 磁盘：AI 工具目录合计 %.2f GB，可清理（%d 天前的会话记录）%.2f GB ---",
+                 r.diskTotalAIGB, ProcessScanner.shared.logRetentionDays, r.purgeableMB / 1024))
+    for d in r.disk {
+        print(String(format: "  %@ %-16@ %7.0f MB (%d 文件)%@  %@", d.purgeable ? "🧹" : "🔒", d.label, d.totalMB, d.files,
+                     d.purgeable ? String(format: "  其中旧 %.0f MB/%d 个", d.oldMB, d.oldFiles) : "", d.note))
     }
     print("--- 压力信号（图标画第一条）---")
     for s in r.pressures.prefix(8) {

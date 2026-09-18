@@ -347,6 +347,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.uninstallProxy()
         }
         actions.copyProxyPrefix = { [weak self] in self?.copyProxyPrefix() }
+        actions.purgeLogs = { [weak self] in
+            self?.menu.cancelTracking()
+            self?.purgeLogsAction()
+        }
         actions.relayout = { [weak self] in self?.relayoutMenuPanel() }
 
         let dashboard = DashboardView(
@@ -398,6 +402,40 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.sendNotification(
                     title: "清理完成",
                     body: "已释放 \(r.killed) 个断链 AI 进程，回收 \(String(format: "%.0f", r.freedMB)) MB 内存。" + (r.skipped > 0 ? "（\(r.skipped) 个已自行退出或 pid 变化，已跳过）" : "")
+                )
+                self?.updateStatus()
+            }
+        }
+    }
+
+    /// 删文件是不可逆动作 → 先弹确认，把"删什么、删多少、会失去什么、能不能捞回来"全写清楚
+    @objc func purgeLogsAction() {
+        let days = ProcessScanner.shared.logRetentionDays
+        let items = currentReport.disk.filter { $0.purgeable && $0.oldMB >= 1 }
+        let totalMB = items.reduce(0.0) { $0 + $1.oldMB }
+        let totalFiles = items.reduce(0) { $0 + $1.oldFiles }
+        guard totalFiles > 0 else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "清理 \(days) 天前的会话记录？"
+        alert.informativeText = items.map {
+            String(format: "· %@：%d 个文件 %.0f MB\n  %@", $0.label, $0.oldFiles, $0.oldMB, $0.note)
+        }.joined(separator: "\n")
+        + String(format: "\n\n合计 %d 个文件 %.2f GB，移入废纸篓（可恢复）。\n近 %d 天的一个都不动。",
+                 totalFiles, totalMB / 1024, days)
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "移入废纸篓")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let r = ProcessScanner.shared.purgeOldSessionLogs(olderThanDays: days)
+            DispatchQueue.main.async {
+                self?.sendNotification(
+                    title: "会话记录已清理",
+                    body: String(format: "%d 个文件、%.2f GB 已移入废纸篓。", r.files, r.freedMB / 1024)
+                        + (r.failed > 0 ? "（\(r.failed) 个失败，多半是权限）" : "")
                 )
                 self?.updateStatus()
             }
