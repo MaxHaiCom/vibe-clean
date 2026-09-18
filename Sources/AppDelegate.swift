@@ -56,6 +56,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         setupAutoCleanTimer()
+        setupWakeObserver()
+    }
+
+    /// 睡醒后 MCP 的父进程常常已经没了，这时候是收割的最好时机。
+    /// 延迟 60 秒再跑：让系统先把网络/磁盘缓过来，也给 CLI 自己重连的机会。
+    private func setupWakeObserver() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self, self.isAutoCleanEnabled else { return }
+            self.log.notice("检测到系统唤醒，60 秒后巡检")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+                self?.performSilentAutoClean(reason: "唤醒")
+            }
+        }
     }
 
     private func setupAutoCleanTimer() {
@@ -64,12 +79,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if isAutoCleanEnabled {
             autoCleanTimer = Timer.scheduledTimer(withTimeInterval: 1800.0, repeats: true) { [weak self] _ in
-                self?.performSilentAutoClean()
+                self?.performSilentAutoClean(reason: "定时")
             }
         }
     }
 
-    private func performSilentAutoClean() {
+    /// 触发静默清理的三个时机：定时 30 分钟、睡醒、内存吃紧。
+    /// 三者共用同一条保守路径（只动连续两次扫描都是孤儿、且已孤儿 ≥120s 的），并加 5 分钟总闸防风暴。
+    private var lastAutoCleanAt: TimeInterval = 0
+
+    /// 内存吃紧该不该立刻收割（纯判断，可自测）
+    public static func shouldReapForMemory(usedPct: Int, lastCleanAt: TimeInterval, now: TimeInterval) -> Bool {
+        usedPct >= 85 && now - lastCleanAt >= 300
+    }
+
+    private func performSilentAutoClean(reason: String = "定时") {
+        let now = Date().timeIntervalSince1970
+        guard now - lastAutoCleanAt >= 300 else {
+            log.debug("自动清理跳过（\(reason)）：距上次不足 5 分钟")
+            return
+        }
+        lastAutoCleanAt = now
+        log.notice("自动清理触发：\(reason)")
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let report = ProcessScanner.shared.scan()
             // 静默清理更保守：只动「连续两次扫描都是孤儿」的，避开 CLI 正在重启 MCP 的瞬态
@@ -164,8 +195,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.isScanning = false
                 self?.currentReport = report
                 self?.renderStatusButton(report: report)
+                self?.reapIfMemoryTight(report)
             }
         }
+    }
+
+    /// 内存已用 ≥85% 且开了自动清理 → 不等 30 分钟，立刻走一次保守巡检
+    private func reapIfMemoryTight(_ report: ScanReport) {
+        guard isAutoCleanEnabled, report.totalMemoryGB > 0 else { return }
+        let usedPct = max(0, 100 - report.freePercentage)
+        guard Self.shouldReapForMemory(usedPct: usedPct, lastCleanAt: lastAutoCleanAt,
+                                       now: Date().timeIntervalSince1970) else { return }
+        performSilentAutoClean(reason: "内存 \(usedPct)%")
     }
 
     // MARK: - 芯片框架图标 (内嵌居中数字)

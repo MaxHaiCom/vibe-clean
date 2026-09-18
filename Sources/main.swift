@@ -98,6 +98,12 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(ProcessScanner.rollingWindow(stamps, seconds: 3600, limit: 0, now: now) == nil, "没填上限就不估")
     }
 
+    // 内存吃紧才立刻收割，且 5 分钟内不重复
+    precondition(AppDelegate.shouldReapForMemory(usedPct: 90, lastCleanAt: 0, now: now))
+    precondition(!AppDelegate.shouldReapForMemory(usedPct: 60, lastCleanAt: 0, now: now), "内存不紧就别动")
+    precondition(!AppDelegate.shouldReapForMemory(usedPct: 90, lastCleanAt: now - 60, now: now), "1 分钟前刚清过")
+    precondition(AppDelegate.shouldReapForMemory(usedPct: 90, lastCleanAt: now - 400, now: now))
+
     // 限流响应头 → 额度（各家写法不同，统一按"去掉 limit/remaining/reset 后同族"配对）
     do {
         // Anthropic：族名在前，reset 是 ISO8601

@@ -906,7 +906,7 @@ public struct DashboardView: View {
             Text("设置")
                 .font(.system(size: 11, weight: .bold))
                 .foregroundColor(.secondary)
-            settingRow("定时自动清理", detail: "每 30 分钟静默巡检孤儿 MCP",
+            settingRow("定时自动清理", detail: "每 30 分钟 + 睡醒后 + 内存 ≥85% 时静默巡检",
                        isOn: Binding(get: { autoCleanOn }, set: { autoCleanOn = $0; actions.setAutoClean($0) }))
             settingRow("登录时自动启动", detail: "随 macOS 登录常驻菜单栏",
                        isOn: Binding(get: { launchAtLoginOn }, set: { launchAtLoginOn = $0; actions.setLaunchAtLogin($0) }))
