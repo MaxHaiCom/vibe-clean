@@ -770,6 +770,26 @@ public struct DashboardView: View {
 
             Divider().opacity(0.35)
 
+            // 记账覆盖体检：有 BASE_URL 没走代理 = 面板上看不到那些调用
+            let cov = currentAPI.coverage
+            if !cov.entries.isEmpty {
+                HStack(spacing: 5) {
+                    Image(systemName: cov.directCount > 0 ? "exclamationmark.triangle" : "checkmark.seal")
+                        .font(.system(size: 8))
+                        .foregroundColor(cov.directCount > 0 ? .orange : .green)
+                    Text("记账覆盖 \(cov.proxiedCount)/\(cov.entries.count) 处")
+                        .font(.system(size: 9, weight: .medium))
+                    if cov.directCount > 0 {
+                        Text("· 未接：" + cov.entries.filter { !$0.proxied }.prefix(3).map { $0.host }.joined(separator: " "))
+                            .font(.system(size: 8))
+                            .foregroundColor(.orange)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                }
+                .help(cov.entries.map { "\($0.proxied ? "✓" : "✗") \($0.name) → \($0.host)  (\($0.file):\($0.line))" }.joined(separator: "\n"))
+            }
+
             // 代理控制
             HStack(spacing: 8) {
                 if currentAPI.installed {

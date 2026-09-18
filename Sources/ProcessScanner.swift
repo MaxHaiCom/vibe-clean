@@ -227,8 +227,25 @@ public struct APIProviderStatus: Identifiable {
     public var errorRate: Double { calls > 0 ? Double(errors) / Double(calls) * 100.0 : 0.0 }
 }
 
+/// 记账覆盖体检：shell 配置里的 *_BASE_URL 有几处走了代理、几处没走。
+/// 没走的那些 = 面板上看不到的调用（账上的窟窿）。只取变量名与主机名，绝不碰同一行里的 key。
+public struct ProxyCoverage {
+    public struct Entry: Identifiable {
+        public var id: String { "\(file):\(line):\(name)" }
+        public let name: String        // 变量名，如 ANTHROPIC_BASE_URL
+        public let host: String        // 上游主机
+        public let file: String        // 哪个 rc 文件
+        public let line: Int
+        public let proxied: Bool
+    }
+    public var entries: [Entry] = []
+    public var proxiedCount: Int { entries.filter { $0.proxied }.count }
+    public var directCount: Int { entries.filter { !$0.proxied }.count }
+}
+
 public struct ProxyStatus {
     public var installed: Bool = false
+    public var coverage: ProxyCoverage = ProxyCoverage()
     /// 价目表状态（没配就别在界面上编花费）
     public var hasPriceTable: Bool = false
     public var priceAsOf: String = ""
@@ -2024,6 +2041,49 @@ public final class ProcessScanner {
         if let first = apiCalls.first, first.ts < horizon { apiCalls.removeAll { $0.ts < horizon } }
     }
 
+    // MARK: 记账覆盖体检（哪些 BASE_URL 没走代理）
+
+    private var coverageCache: (at: TimeInterval, cov: ProxyCoverage)? = nil
+
+    /// 从一行 shell 配置里抠出「变量名 + 上游主机」。**只取这两样**：同一行常常跟着 API key，
+    /// 我们既不解析也不保存它。返回 nil = 这行没有 BASE_URL。
+    public static func parseBaseURLLine(_ raw: String, proxyPrefix: String) -> (name: String, host: String, proxied: Bool)? {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        guard !line.hasPrefix("#") else { return nil }
+        // URL 取到第一个引号/空白/反斜杠为止：zsh 里这些行常以续行符 \ 结尾
+        guard let re = try? NSRegularExpression(pattern: #"([A-Z0-9_]*(?:BASE_URL|API_BASE|BASE_URI))\s*=\s*["']?([^"'\s\\]+)"#) else { return nil }
+        let ns = line as NSString
+        guard let m = re.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        let name = ns.substring(with: m.range(at: 1))
+        var url = ns.substring(with: m.range(at: 2))
+        let proxied = url.hasPrefix(proxyPrefix)
+        if proxied { url = String(url.dropFirst(proxyPrefix.count)) }
+        // 取主机：可能是 https://host/path，也可能被代理前缀包成 http://127.0.0.1:18790/https://host/path
+        let host = url
+            .replacingOccurrences(of: #"^https?://"#, with: "", options: .regularExpression)
+            .split(separator: "/").first.map(String.init) ?? url
+        guard !host.isEmpty, host.contains(".") || host.contains(":") else { return nil }
+        return (name, host, proxied)
+    }
+
+    /// 扫 shell 配置。只读用户自己的 rc 文件，60s 节流。
+    public func scanProxyCoverage() -> ProxyCoverage {
+        let now = Date().timeIntervalSince1970
+        if let c = coverageCache, now - c.at < 60 { return c.cov }
+        let prefix = ProxyManager.shared.prefix
+        var cov = ProxyCoverage()
+        for f in [".zshrc", ".zshenv", ".bashrc", ".bash_profile", ".profile"] {
+            let path = "\(home)/\(f)"
+            guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            for (i, line) in text.components(separatedBy: "\n").enumerated() {
+                guard let e = Self.parseBaseURLLine(line, proxyPrefix: prefix) else { continue }
+                cov.entries.append(ProxyCoverage.Entry(name: e.name, host: e.host, file: f, line: i + 1, proxied: e.proxied))
+            }
+        }
+        coverageCache = (now, cov)
+        return cov
+    }
+
     private func balanceText(_ d: [String: Any]) -> String {
         let cur = (d["currency"] as? String ?? "").uppercased()
         let sym = cur == "CNY" ? "¥" : (cur == "USD" ? "$" : (cur.isEmpty ? "" : cur + " "))
@@ -2140,6 +2200,7 @@ public final class ProcessScanner {
                 byHost[host] = p
             }
         }
+        st.coverage = scanProxyCoverage()
         st.hasPriceTable = !prices.isEmpty
         st.priceAsOf = prices.asOf
         st.providers = byHost.values.sorted { $0.lastTS > $1.lastTS }

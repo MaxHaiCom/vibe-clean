@@ -98,6 +98,23 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(ProcessScanner.rollingWindow(stamps, seconds: 3600, limit: 0, now: now) == nil, "没填上限就不估")
     }
 
+    // 记账覆盖体检：只抠变量名与主机，同一行的 key 一律不碰
+    do {
+        let pfx = "http://127.0.0.1:18790/"
+        let a = ProcessScanner.parseBaseURLLine("  export ANTHROPIC_BASE_URL=http://127.0.0.1:18790/https://open.bigmodel.cn/api/anthropic", proxyPrefix: pfx)!
+        precondition(a.name == "ANTHROPIC_BASE_URL" && a.host == "open.bigmodel.cn" && a.proxied)
+        let b = ProcessScanner.parseBaseURLLine("OPENAI_API_BASE='https://api.deepseek.com/v1'", proxyPrefix: pfx)!
+        precondition(b.host == "api.deepseek.com" && !b.proxied)
+        precondition(ProcessScanner.parseBaseURLLine("# ANTHROPIC_BASE_URL=https://x.com", proxyPrefix: pfx) == nil, "注释行不算")
+        precondition(ProcessScanner.parseBaseURLLine("export ANTHROPIC_API_KEY=sk-ant-xxxx", proxyPrefix: pfx) == nil, "key 行不该被当成 BASE_URL")
+        precondition(ProcessScanner.parseBaseURLLine("alias cc='claude'", proxyPrefix: pfx) == nil)
+        // zsh 里这些行普遍以续行符结尾，别被它吃掉
+        let c = ProcessScanner.parseBaseURLLine("    ANTHROPIC_BASE_URL=http://127.0.0.1:18790/https://openrouter.ai/api \\", proxyPrefix: pfx)!
+        precondition(c.host == "openrouter.ai" && c.proxied, "实际 \(c)")
+        let d = ProcessScanner.parseBaseURLLine("  ANTHROPIC_BASE_URL=\"http://127.0.0.1:18790/http://localhost:18080\" \\", proxyPrefix: pfx)!
+        precondition(d.host == "localhost:18080" && d.proxied, "实际 \(d)")
+    }
+
     // 燃烧速率：窗口长度 + 重置点 → 不用攒历史采样
     do {
         // 5h 窗口过了 1 小时用掉 20% → 4%/h，到重置(还剩 4h)会到 100%
@@ -170,6 +187,9 @@ if CommandLine.arguments.contains("--selftest") {
     let rs = ProcessScanner.shared.codexRemoteStatus()
     print("Codex 远程 \(rs.host): \(rs.ok ? "已连上" : "未连上") · \(rs.ageSeconds)s 前拉取")
     let a = r.api
+    let cov = a.coverage
+    print("--- 记账覆盖 \(cov.proxiedCount)/\(cov.entries.count) 处走代理 ---")
+    for e in cov.entries { print("  \(e.proxied ? "✓" : "✗") \(e.name) → \(e.host)  (\(e.file):\(e.line))") }
     print("--- API 代理 --- 安装=\(a.installed) 运行=\(a.running) 端口=\(a.port) 启动后调用=\(a.callsSinceStart)")
     print("  价目表: " + (a.hasPriceTable ? "已配置 \(a.priceAsOf)" : "未配置（~/.config/vibegauge/prices.json）"))
     for p in a.providers {
