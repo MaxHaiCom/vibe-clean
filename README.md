@@ -30,6 +30,17 @@
 | Grok | `~/.grok/settings_cache.json` → `subscription_tier_display` 原值 | `~/.grok/logs/unified.jsonl` 最后一条 `billing: fetched credits config`（`creditUsagePercent` = 周额度已用 %，`currentPeriod.end` = 重置点；grok 跑着时每几分钟记一次） | 该行 `ts` |
 | Ollama / LM Studio / Cursor | 只探测进程在线 | 无 | — |
 
+各家额度的**更新时机**（都不是本工具能控制的，没有不花额度的查询接口）：
+
+| 平台 | 什么时候写出新的额度数字 |
+|------|------------------------|
+| Claude | 每轮对话（Claude Code 状态栏每次渲染都带服务端下发的 `rate_limits`）→ 最快 |
+| Codex | **只在真的发出请求时**（会话 jsonl 的 `token_count` 事件）。开着 TUI 不产生任何额度记录 |
+| Gemini | agy 跑起来时由 agy-hud 刷 `quota_cache.json` |
+| Grok | grok 自己在跑时不定期拉一次 billing 配置，不必产生对话 |
+
+所以卡片脚注的"记录于 Nh前"是**数据源的年龄**，不是本工具没刷新。
+
 额度规则：
 - 已过 `resets_at` 的缓存值视为 **0%**（"已重置"），不再显示过期高值。
 - 采集时间超过 5 分钟 → 卡片脚注橙色标出"记录于 Nh前"（主池、副池分别标）。Claude 额度只在 Claude Code 状态栏渲染时更新，Codex 额度只在某台机器的 Codex 会话产生 token 事件时更新，这两处"旧"是数据源本身的限制。

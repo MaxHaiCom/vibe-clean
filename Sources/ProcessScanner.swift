@@ -272,8 +272,23 @@ public final class ProcessScanner {
     }
 
     private static func binName(_ cmd: String) -> String {
-        guard let first = cmd.split(separator: " ").first else { return "" }
-        return String(first.split(separator: "/").last ?? "")
+        String(executablePath(cmd).split(separator: "/").last ?? "")
+    }
+
+    /// 命令行的第一个 token = 可执行文件路径。
+    /// 探测必须只看这个，不能在整条命令行里找子串：任何 shell 命令（包括别人 grep 这些名字）都会命中，造成误判。
+    private static func executablePath(_ cmd: String) -> String {
+        String(cmd.split(separator: " ").first ?? "")
+    }
+
+    /// 某个 App/CLI 是否真的在跑：看可执行文件路径，且跳过 shell 包装器
+    private static func isRunning(_ cmd: String, bundle: String, bins: [String]) -> Bool {
+        let t = cmd.trimmingCharacters(in: .whitespaces)
+        if isShellWrapper(t) { return false }
+        let exe = executablePath(t).lowercased()
+        if !bundle.isEmpty, exe.contains(bundle) { return true }
+        let bin = String(exe.split(separator: "/").last ?? "")
+        return bins.contains(bin)
     }
 
     public static func isClaudeCLISession(cmd: String) -> Bool {
@@ -286,6 +301,8 @@ public final class ProcessScanner {
         let t = cmd.trimmingCharacters(in: .whitespaces)
         if isShellWrapper(t) { return false }
         if t.contains("mcp-server") || t.contains("ChatGPT for Chrome") || t.contains("chrome-extension") || t.contains("ssh") || t.contains("grep") { return false }
+        // 同一会话派生出来的组件，不是独立会话
+        if t.contains("codex-darwin") || t.contains("/vendor/") || t.contains("codex-path") || t.contains("/plugins/cache/") || t.contains("cua_node") { return false }
         let bin = binName(t)
         if bin == "codex" || bin == "codex.js" { return true }
         let parts = t.split(separator: " ")
@@ -385,18 +402,42 @@ public final class ProcessScanner {
         return procs
     }
 
+    private enum CLIKind { case claude, codex, agy, grok }
+
     private func countSessions(_ procs: [Int: RawProc]) -> SessionCounts {
         var c = SessionCounts()
+
+        // 第一遍：命中的进程
+        var matched: [Int: CLIKind] = [:]
         for p in procs.values {
-            let lower = p.cmd.lowercased()
-            if lower.contains("cursor.app") || (lower.contains("/cursor") && !lower.contains("cursoruiviewservice")) { c.cursor = true }
-            if lower.contains("ollama") { c.ollama = true }
-            if lower.contains("lmstudio") || lower.contains("lm studio") { c.lmStudio = true }
+            if ProcessScanner.isRunning(p.cmd, bundle: "/cursor.app/", bins: ["cursor"]) { c.cursor = true }
+            if ProcessScanner.isRunning(p.cmd, bundle: "/ollama.app/", bins: ["ollama"]) { c.ollama = true }
+            if ProcessScanner.isRunning(p.cmd, bundle: "lm studio.app/", bins: ["lm studio", "lmstudio"]) { c.lmStudio = true }
             guard p.ppid != 1 else { continue }
-            if ProcessScanner.isClaudeCLISession(cmd: p.cmd) { c.claude += 1 }
-            else if ProcessScanner.isCodexCLISession(cmd: p.cmd) { c.codex += 1 }
-            else if ProcessScanner.isAgyCLISession(cmd: p.cmd) { c.agy += 1 }
-            else if ProcessScanner.isGrokCLISession(cmd: p.cmd) { c.grok += 1 }
+            if ProcessScanner.isClaudeCLISession(cmd: p.cmd) { matched[p.pid] = .claude }
+            else if ProcessScanner.isCodexCLISession(cmd: p.cmd) { matched[p.pid] = .codex }
+            else if ProcessScanner.isAgyCLISession(cmd: p.cmd) { matched[p.pid] = .agy }
+            else if ProcessScanner.isGrokCLISession(cmd: p.cmd) { matched[p.pid] = .grok }
+        }
+
+        // 第二遍：一个会话 = 一棵进程树的根。CLI 会派生同名子进程（node 包装器 → 原生二进制 → 插件宿主），
+        // 祖先已命中的就不再单独算一个会话，否则一个 Codex 会话会被数成 3 个。
+        for (pid, kind) in matched {
+            var cur = procs[pid]?.ppid ?? 1
+            var hops = 0
+            var nested = false
+            while cur > 1, hops < 30 {
+                if matched[cur] != nil { nested = true; break }
+                cur = procs[cur]?.ppid ?? 1
+                hops += 1
+            }
+            if nested { continue }
+            switch kind {
+            case .claude: c.claude += 1
+            case .codex: c.codex += 1
+            case .agy: c.agy += 1
+            case .grok: c.grok += 1
+            }
         }
         // Grok 双保险：~/.grok/active_sessions.json 里存活的 pid
         if c.grok == 0,

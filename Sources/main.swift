@@ -36,6 +36,13 @@ if CommandLine.arguments.contains("--selftest") {
     precondition(Fmt.parseISODate("2026-09-17T09:07:45.133Z") != nil)           // claude 3 位
     precondition(Fmt.parseISODate("2026-09-17T03:14:39Z") != nil)               // 无小数
 
+    // 探测只看可执行文件路径：别人 grep 这些名字不该算"在跑"
+    precondition(ProcessScanner.isClaudeCLISession(cmd: "claude --resume abc"))
+    precondition(!ProcessScanner.isClaudeCLISession(cmd: "/bin/zsh -c ps -ax | grep claude"))
+    precondition(ProcessScanner.isCodexCLISession(cmd: "node /Users/x/.npm-global/bin/codex --foo"))
+    precondition(!ProcessScanner.isCodexCLISession(cmd: "/Users/x/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path/rg"))
+    precondition(!ProcessScanner.isCodexCLISession(cmd: "ssh host codex mcp-server"))
+
     let t0 = Date()
     let r = ProcessScanner.shared.scan()
     let t1 = Date()
