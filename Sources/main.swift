@@ -98,6 +98,14 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(ProcessScanner.rollingWindow(stamps, seconds: 3600, limit: 0, now: now) == nil, "没填上限就不估")
     }
 
+    // ssh 主机名会被拼进 shell 命令 → 只放行合法主机名
+    precondition(ProcessScanner.isValidSSHHost("mac-mini"))
+    precondition(ProcessScanner.isValidSSHHost("user@192.168.1.9"))
+    precondition(!ProcessScanner.isValidSSHHost("mac-mini; rm -rf ~"))
+    precondition(!ProcessScanner.isValidSSHHost("$(whoami)"))
+    precondition(!ProcessScanner.isValidSSHHost("a`id`b"))
+    precondition(!ProcessScanner.isValidSSHHost(""))
+
     let t0 = Date()
     let r = ProcessScanner.shared.scan()
     let t1 = Date()

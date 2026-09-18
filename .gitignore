@@ -5,3 +5,10 @@ VibeGauge
 *.iconset/
 .claude/
 *.bak
+*.env
+*.env.*
+*.pem
+*.key
+*.p8
+prices.json
+plans.json

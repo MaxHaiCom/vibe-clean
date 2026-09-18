@@ -1053,7 +1053,15 @@ public final class ProcessScanner {
     /// 另一台真正跑 Codex 的机器（默认空 = 关闭远程合并）。
     /// 开启：`defaults write com.haifeng.vibegauge codexRemoteHost <ssh-host>`，该 host 需能免密 ssh。
     public var codexRemoteHost: String {
-        (UserDefaults.standard.string(forKey: "codexRemoteHost") ?? "").trimmingCharacters(in: .whitespaces)
+        let raw = (UserDefaults.standard.string(forKey: "codexRemoteHost") ?? "").trimmingCharacters(in: .whitespaces)
+        return Self.isValidSSHHost(raw) ? raw : ""
+    }
+
+    /// 这个值会被拼进 `ssh <host> '...'` 的 shell 命令，所以只放行合法主机名/别名/user@host。
+    /// 虽然只有本机用户能写这个 UserDefaults，但拼 shell 就该校验 —— 别给分号和反引号留门。
+    public static func isValidSSHHost(_ h: String) -> Bool {
+        guard !h.isEmpty, h.count <= 255 else { return false }
+        return h.range(of: #"^[A-Za-z0-9._-]+(@[A-Za-z0-9._-]+)?$"#, options: .regularExpression) != nil
     }
 
     public func codexRemoteStatus() -> (host: String, ok: Bool, ageSeconds: Int) {
