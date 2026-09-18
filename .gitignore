@@ -1,6 +1,6 @@
 .DS_Store
-VibeClean.app/
-VibeClean
+VibeGauge.app/
+VibeGauge
 *.o
 *.iconset/
 .claude/
