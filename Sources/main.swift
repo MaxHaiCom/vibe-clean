@@ -98,6 +98,24 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(ProcessScanner.rollingWindow(stamps, seconds: 3600, limit: 0, now: now) == nil, "没填上限就不估")
     }
 
+    // 燃烧速率：窗口长度 + 重置点 → 不用攒历史采样
+    do {
+        // 5h 窗口过了 1 小时用掉 20% → 4%/h，到重置(还剩 4h)会到 100%
+        let w = QuotaWindow(usedPct: 20, resetsAt: now + 4 * 3600, capturedAt: now, windowSeconds: 5 * 3600)
+        let b = w.burn(now: now)!
+        precondition(abs(b.pctPerHour - 20.0) < 0.01, "1 小时用 20% = 20%/h，实际 \(b.pctPerHour)")
+        precondition(b.projectedAtReset == 100, "实际 \(b.projectedAtReset)")
+        precondition(b.exhaustAt != nil && abs(b.exhaustAt! - (now + 4 * 3600)) < 60)
+        // 慢速：4h 才用 10% → 到重置只有 12%，不该报"会打满"
+        let slow = QuotaWindow(usedPct: 10, resetsAt: now + 3600, capturedAt: now, windowSeconds: 5 * 3600)
+        precondition(slow.burn(now: now)!.exhaustAt == nil)
+        // 窗口刚开头 / 没窗口长度 / 已过重置 → 一律不推算，不瞎猜
+        precondition(QuotaWindow(usedPct: 5, resetsAt: now + 17_500, capturedAt: now, windowSeconds: 5 * 3600).burn(now: now) == nil)  // 窗口才过 500 秒
+        precondition(QuotaWindow(usedPct: 50, resetsAt: now + 3600, capturedAt: now).burn(now: now) == nil)
+        precondition(QuotaWindow(usedPct: 50, resetsAt: now - 1, capturedAt: now, windowSeconds: 5 * 3600).burn(now: now) == nil)
+        precondition(QuotaWindow(usedPct: 100, resetsAt: now + 3600, capturedAt: now, windowSeconds: 5 * 3600).burn(now: now) == nil, "已打满不推算")
+    }
+
     // 会话日志保留期硬下限 7 天（本工具自己要读近两天的文件算额度）
     precondition(ProcessScanner.effectiveRetention(30) == 30)
     precondition(ProcessScanner.effectiveRetention(3) == 7)
@@ -140,7 +158,11 @@ if CommandLine.arguments.contains("--selftest") {
         guard let q = q else { return "" }
         let reset = Fmt.countdown(to: q.resetsAt, now: now) ?? "?"
         let age = q.ageSeconds(now: now).map { Fmt.ago($0) } ?? "?"
-        return "  \(label)=\(q.effectivePct(now: now))%(raw \(q.usedPct), 重置 \(reset), 采集 \(age))"
+        let burn = q.burn(now: now).map {
+            String(format: ", %.1f%%/h→重置时 %d%%%@", $0.pctPerHour, $0.projectedAtReset,
+                   $0.exhaustAt.flatMap { Fmt.countdown(to: $0, now: now) }.map { " ⚡\($0)后打满" } ?? "")
+        } ?? ""
+        return "  \(label)=\(q.effectivePct(now: now))%(raw \(q.usedPct), 重置 \(reset), 采集 \(age)\(burn))"
     }
     for l in r.detectedLLMs {
         print("\(l.isRunning ? "●" : "○") \(l.name) [\(l.tier)] \(l.detail)" + w("5H", l.fiveHour) + w("W", l.sevenDay) + w("\(l.secondaryPoolName)5H", l.secondaryFiveHour) + w("\(l.secondaryPoolName)W", l.secondarySevenDay) + (l.hasQuota ? "" : "  | \(l.quotaSubtitle)"))

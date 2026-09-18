@@ -1091,8 +1091,30 @@ public struct DashboardView: View {
 
     /// 第三行脚注：可换两行，不截断
     @ViewBuilder
+    /// 照当前速度会在重置前打满的那个窗口 → 卡片上给一句 ETA。用不完就什么都不说。
+    private func burnWarning(for llm: DetectedLLMRuntime) -> String {
+        let wins: [(String, QuotaWindow?)] = [("5h", llm.fiveHour), ("周", llm.sevenDay),
+                                              ("\(llm.secondaryPoolName) 5h", llm.secondaryFiveHour),
+                                              ("\(llm.secondaryPoolName) 周", llm.secondarySevenDay)]
+        var best: (String, TimeInterval)? = nil
+        for (label, w) in wins {
+            guard let w = w, let b = w.burn(now: nowTS), let at = b.exhaustAt else { continue }
+            if best == nil || at < best!.1 { best = (label, at) }
+        }
+        guard let (label, at) = best, let eta = Fmt.countdown(to: at, now: nowTS) else { return "" }
+        return "照这速度 \(label) 约 \(eta) 后打满"
+    }
+
+    @ViewBuilder
     private func quotaFooter(for llm: DetectedLLMRuntime) -> some View {
         let parts = footerParts(for: llm)
+        let burn = burnWarning(for: llm)
+        if !burn.isEmpty {
+            Text("⚡ " + burn)
+                .font(.system(size: 7))
+                .foregroundColor(.orange)
+                .lineLimit(1)
+        }
         if !parts.resets.isEmpty || !parts.stale.isEmpty {
             (Text(parts.resets)
                 + Text(parts.resets.isEmpty || parts.stale.isEmpty ? "" : " · ")
@@ -1355,6 +1377,35 @@ public struct DashboardView: View {
                     }
                     if let sw = llm.secondarySevenDay {
                         quotaRing(label: "\(llm.secondaryPoolName)池 周", win: sw).frame(maxWidth: .infinity)
+                    }
+                }
+            }
+        }
+
+        // 1.5 燃烧速率（窗口长度已知才算：本窗口迄今的平均速度）
+        let burns: [(String, Burn)] = [("5 小时", llm.fiveHour), ("周", llm.sevenDay),
+                                       ("\(llm.secondaryPoolName) 5 小时", llm.secondaryFiveHour),
+                                       ("\(llm.secondaryPoolName) 周", llm.secondarySevenDay)]
+            .compactMap { label, w in w?.burn(now: nowTS).map { (label, $0) } }
+        if !burns.isEmpty {
+            card {
+                sectionTitle("燃烧速率（本窗口迄今平均）")
+                ForEach(Array(burns.enumerated()), id: \.offset) { _, item in
+                    let b = item.1
+                    HStack(spacing: 4) {
+                        Text(item.0).font(.system(size: 9)).foregroundColor(.secondary).lineLimit(1)
+                        Spacer(minLength: 4)
+                        Text(String(format: "%.1f%%/小时", b.pctPerHour))
+                            .font(.system(size: 9, weight: .semibold))
+                        Text("→ 重置时 \(b.projectedAtReset)%")
+                            .font(.system(size: 8.5))
+                            .foregroundColor(b.projectedAtReset >= 100 ? .orange : .secondary)
+                        if let at = b.exhaustAt, let eta = Fmt.countdown(to: at, now: nowTS) {
+                            Text("· \(eta) 后打满")
+                                .font(.system(size: 8.5, weight: .semibold))
+                                .foregroundColor(.orange)
+                                .fixedSize()
+                        }
                     }
                 }
             }

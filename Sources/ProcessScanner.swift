@@ -75,10 +75,21 @@ public struct CLIUsage: Identifiable {
 }
 
 /// 一个额度窗口（5h / 周）：已用百分比 + 重置点 + 数据采集时间
+/// 按当前速度推算的燃烧情况
+public struct Burn: Equatable {
+    public let pctPerHour: Double
+    /// 照这个速度，到重置点会用到百分之多少（可能 >100）
+    public let projectedAtReset: Int
+    /// 预计打满的时刻；nil = 到重置也用不完
+    public let exhaustAt: TimeInterval?
+}
+
 public struct QuotaWindow: Equatable {
     public var usedPct: Int
     public var resetsAt: TimeInterval?
     public var capturedAt: TimeInterval?
+    /// 这个窗口有多长（5h = 18000，周 = 604800）。0 = 不知道 → 不推算，不瞎猜
+    public var windowSeconds: Double = 0
 
     public func isExpired(now: TimeInterval = Date().timeIntervalSince1970) -> Bool {
         guard let r = resetsAt else { return false }
@@ -92,6 +103,22 @@ public struct QuotaWindow: Equatable {
 
     public func ageSeconds(now: TimeInterval = Date().timeIntervalSince1970) -> Int? {
         capturedAt.map { max(0, Int(now - $0)) }
+    }
+
+    /// 燃烧速率：窗口长度和重置点都知道 → 窗口内已经过去多久也就知道，不必攒历史采样。
+    /// 口径 = 本窗口迄今的平均速度（不是瞬时速度），窗口刚开头 15 分钟内不推算（样本太短，噪声大）。
+    public func burn(now: TimeInterval = Date().timeIntervalSince1970) -> Burn? {
+        guard windowSeconds > 0, let reset = resetsAt else { return nil }
+        let remaining = reset - now
+        guard remaining > 0 else { return nil }                       // 已过重置点，旧值作废
+        let elapsed = windowSeconds - remaining
+        guard elapsed >= 900 else { return nil }
+        let pct = Double(effectivePct(now: now))
+        guard pct > 0, pct < 100 else { return nil }      // 已经打满了就没什么可推算的
+        let perHour = pct / (elapsed / 3600)
+        let projected = pct + perHour * (remaining / 3600)
+        let exhaust: TimeInterval? = projected >= 100 ? now + (100 - pct) / perHour * 3600 : nil
+        return Burn(pctPerHour: perHour, projectedAtReset: Int(projected.rounded()), exhaustAt: exhaust)
     }
 }
 
@@ -1141,22 +1168,23 @@ public final class ProcessScanner {
     private func readClaudeQuota() -> (fiveHour: QuotaWindow?, sevenDay: QuotaWindow?, extraName: String, extra5h: QuotaWindow?, extraW: QuotaWindow?) {
         guard let json = readJSON("\(home)/.claude/claude-usage.json") else { return (nil, nil, "", nil, nil) }
         let captured = (json["_captured_at"] as? NSNumber)?.doubleValue
-        func win(_ d: Any?) -> QuotaWindow? {
+        func win(_ d: Any?, _ windowSeconds: Double) -> QuotaWindow? {
             guard let d = d as? [String: Any], let used = clampPct(d["used_percentage"] as? NSNumber) else { return nil }
-            return QuotaWindow(usedPct: used, resetsAt: (d["resets_at"] as? NSNumber)?.doubleValue, capturedAt: captured)
+            return QuotaWindow(usedPct: used, resetsAt: (d["resets_at"] as? NSNumber)?.doubleValue,
+                               capturedAt: captured, windowSeconds: windowSeconds)
         }
         var extraName = ""
         var extra5h: QuotaWindow? = nil
         var extraW: QuotaWindow? = nil
         for (k, v) in json where !["five_hour", "seven_day", "_captured_at"].contains(k) {
-            guard let w = win(v) else { continue }
+            guard let w = win(v, k.hasPrefix("five_hour") ? 5 * 3600 : 7 * 86400) else { continue }
             let base = k.replacingOccurrences(of: "seven_day_", with: "").replacingOccurrences(of: "five_hour_", with: "")
             let name = base.prefix(1).uppercased() + base.dropFirst()
             guard extraName.isEmpty || extraName == name else { continue }   // 只展示一个副池
             extraName = name
             if k.hasPrefix("five_hour") { extra5h = w } else { extraW = w }
         }
-        return (win(json["five_hour"]), win(json["seven_day"]), extraName, extra5h, extraW)
+        return (win(json["five_hour"], 5 * 3600), win(json["seven_day"], 7 * 86400), extraName, extra5h, extraW)
     }
 
     // MARK: Codex 额度（按 limit_id 分桶：主桶 "codex"，新版 CLI 另报如 codex_bengalfox/Spark；本机 + 远程合并取最新）
@@ -1235,8 +1263,10 @@ public final class ProcessScanner {
                                 plan: rl["plan_type"] as? String ?? "", captured: ts)
             for key in ["primary", "secondary"] {
                 guard let w = rl[key] as? [String: Any], let used = clampPct(w["used_percent"] as? NSNumber) else { continue }
-                let win = QuotaWindow(usedPct: used, resetsAt: (w["resets_at"] as? NSNumber)?.doubleValue, capturedAt: ts)
-                if ((w["window_minutes"] as? NSNumber)?.intValue ?? 0) >= 1440 { b.weekly = win } else { b.fiveHour = win }
+                let mins = (w["window_minutes"] as? NSNumber)?.intValue ?? 0
+                let win = QuotaWindow(usedPct: used, resetsAt: (w["resets_at"] as? NSNumber)?.doubleValue, capturedAt: ts,
+                                      windowSeconds: mins > 0 ? Double(mins) * 60 : (mins >= 1440 ? 7 * 86400 : 5 * 3600))
+                if mins >= 1440 { b.weekly = win } else { b.fiveHour = win }
             }
             // 百分比全 null（请求被拒时就是这样）→ 不是有效快照，别覆盖旧的真值
             if b.fiveHour != nil || b.weekly != nil { out.buckets[id] = b }
@@ -1341,7 +1371,8 @@ public final class ProcessScanner {
             let now = Date().timeIntervalSince1970
             let stillHit = (hit.resetsAt ?? .greatestFiniteMagnitude) > now
             if stillHit {
-                let win = QuotaWindow(usedPct: 100, resetsAt: hit.resetsAt ?? primary?.weekly?.resetsAt, capturedAt: hit.at)
+                let win = QuotaWindow(usedPct: 100, resetsAt: hit.resetsAt ?? primary?.weekly?.resetsAt, capturedAt: hit.at,
+                                      windowSeconds: 7 * 86400)
                 if primary == nil {
                     primary = CodexBucket(id: "codex", name: "", fiveHour: nil, weekly: win, plan: plan, captured: hit.at)
                 } else {
@@ -1375,7 +1406,11 @@ public final class ProcessScanner {
                       let cfg = ctx["config"] as? [String: Any],
                       let pct = clampPct(cfg["creditUsagePercent"] as? NSNumber) else { continue }
                 let period = cfg["currentPeriod"] as? [String: Any]
-                weekly = QuotaWindow(usedPct: pct, resetsAt: parseISO(period?["end"] as? String), capturedAt: parseISO(json["ts"] as? String))
+                let pStart = parseISO(period?["start"] as? String)
+                let pEnd = parseISO(period?["end"] as? String)
+                // 周期长度用它自己给的起止算；给不出就不推算（windowSeconds 留 0）
+                weekly = QuotaWindow(usedPct: pct, resetsAt: pEnd, capturedAt: parseISO(json["ts"] as? String),
+                                     windowSeconds: (pStart != nil && pEnd != nil) ? max(0, pEnd! - pStart!) : 0)
                 tier = ctx["subscriptionTier"] as? String ?? ""
                 break outer
             }
@@ -1395,7 +1430,8 @@ public final class ProcessScanner {
             return QuotaWindow(
                 usedPct: max(0, min(100, Int(round((1.0 - rf) * 100.0)))),
                 resetsAt: (w["reset_at"] as? NSNumber)?.doubleValue,
-                capturedAt: (w["recorded_at"] as? NSNumber)?.doubleValue ?? (json["updated_at"] as? NSNumber)?.doubleValue
+                capturedAt: (w["recorded_at"] as? NSNumber)?.doubleValue ?? (json["updated_at"] as? NSNumber)?.doubleValue,
+                windowSeconds: key.contains("five") || key.contains("5h") ? 5 * 3600 : 7 * 86400
             )
         }
         let g = pools["gemini"], tp = pools["3p"]
@@ -1918,7 +1954,7 @@ public final class ProcessScanner {
         guard limit > 0 else { return nil }
         let inWindow = stamps.filter { $0 >= now - seconds }
         let pct = min(100, Int((Double(inWindow.count) / Double(limit) * 100).rounded()))
-        return QuotaWindow(usedPct: pct, resetsAt: inWindow.min().map { $0 + seconds }, capturedAt: now)
+        return QuotaWindow(usedPct: pct, resetsAt: inWindow.min().map { $0 + seconds }, capturedAt: now, windowSeconds: seconds)
     }
 
     private var priceCache: (mtime: TimeInterval, table: PriceTable)? = nil
@@ -2093,7 +2129,8 @@ public final class ProcessScanner {
                     let wins = d["windows"] as? [String: Any] ?? [:]
                     func win(_ k: String) -> QuotaWindow? {
                         guard let w = wins[k] as? [String: Any], let used = clampPct(w["used_pct"] as? NSNumber) else { return nil }
-                        return QuotaWindow(usedPct: used, resetsAt: (w["resets_at"] as? NSNumber)?.doubleValue, capturedAt: cap)
+                        return QuotaWindow(usedPct: used, resetsAt: (w["resets_at"] as? NSNumber)?.doubleValue, capturedAt: cap,
+                                           windowSeconds: k == "5h" ? 5 * 3600 : 7 * 86400)
                     }
                     p.fiveHour = win("5h")
                     p.sevenDay = win("weekly")
