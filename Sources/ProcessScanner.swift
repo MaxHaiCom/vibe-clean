@@ -82,6 +82,9 @@ public struct Burn: Equatable {
     public let projectedAtReset: Int
     /// 预计打满的时刻；nil = 到重置也用不完
     public let exhaustAt: TimeInterval?
+    /// 这个速度是怎么来的（界面要说清口径）："近 42 分钟" / "本窗口均"
+    public let basis: String
+    public var isRecent: Bool { basis.hasPrefix("近") }
 }
 
 public struct QuotaWindow: Equatable {
@@ -90,6 +93,9 @@ public struct QuotaWindow: Equatable {
     public var capturedAt: TimeInterval?
     /// 这个窗口有多长（5h = 18000，周 = 604800）。0 = 不知道 → 不推算，不瞎猜
     public var windowSeconds: Double = 0
+    /// 近期速度（本工具自己记的额度采样算出来的，%/小时）。0 = 还没攒够样本
+    public var recentPctPerHour: Double = 0
+    public var recentSpanMinutes: Int = 0
 
     public func isExpired(now: TimeInterval = Date().timeIntervalSince1970) -> Bool {
         guard let r = resetsAt else { return false }
@@ -105,20 +111,31 @@ public struct QuotaWindow: Equatable {
         capturedAt.map { max(0, Int(now - $0)) }
     }
 
-    /// 燃烧速率：窗口长度和重置点都知道 → 窗口内已经过去多久也就知道，不必攒历史采样。
-    /// 口径 = 本窗口迄今的平均速度（不是瞬时速度），窗口刚开头 15 分钟内不推算（样本太短，噪声大）。
+    /// 燃烧速率。两种口径，优先用"近期"：
+    /// - **近期**：本工具自己记的额度采样（近 1 小时内的两点差），反映"当前节奏"，猛用时立刻跟上
+    /// - **窗口均**：本窗口迄今的平均速度（不用任何历史，窗口长度与重置点就够）
+    /// 窗口刚开头不足 15 分钟、没窗口长度、已过重置、已经打满 → 一律不推算。
     public func burn(now: TimeInterval = Date().timeIntervalSince1970) -> Burn? {
         guard windowSeconds > 0, let reset = resetsAt else { return nil }
         let remaining = reset - now
         guard remaining > 0 else { return nil }                       // 已过重置点，旧值作废
         let elapsed = windowSeconds - remaining
-        guard elapsed >= 900 else { return nil }
         let pct = Double(effectivePct(now: now))
-        guard pct > 0, pct < 100 else { return nil }      // 已经打满了就没什么可推算的
-        let perHour = pct / (elapsed / 3600)
+        guard pct < 100 else { return nil }                           // 已经打满了就没什么可推算的
+
+        var perHour: Double
+        var basis: String
+        if recentPctPerHour > 0, recentSpanMinutes >= 10 {
+            perHour = recentPctPerHour
+            basis = "近 \(recentSpanMinutes) 分钟"
+        } else {
+            guard elapsed >= 900, pct > 0 else { return nil }
+            perHour = pct / (elapsed / 3600)
+            basis = "本窗口均"
+        }
         let projected = pct + perHour * (remaining / 3600)
-        let exhaust: TimeInterval? = projected >= 100 ? now + (100 - pct) / perHour * 3600 : nil
-        return Burn(pctPerHour: perHour, projectedAtReset: Int(projected.rounded()), exhaustAt: exhaust)
+        let exhaust: TimeInterval? = projected >= 100 && perHour > 0 ? now + (100 - pct) / perHour * 3600 : nil
+        return Burn(pctPerHour: perHour, projectedAtReset: Int(projected.rounded()), exhaustAt: exhaust, basis: basis)
     }
 }
 
@@ -949,7 +966,7 @@ public final class ProcessScanner {
 
         // 10. Token 遥测 + 11. 各平台档位/额度 + 12. API Key 调用
         report.tokens = scanTokens()
-        report.detectedLLMs = detectAllLLMRuntimes(counts)
+        report.detectedLLMs = withQuotaSamples(detectAllLLMRuntimes(counts))
         report.api = scanAPI()
         report.cliUsage = scanCLIUsage(claude: report.tokens)
         return report
@@ -958,7 +975,15 @@ public final class ProcessScanner {
     /// 轻量探查（1s ticker）：只跑 ps 与小文件读取
     public func scanActiveLLMs() -> [DetectedLLMRuntime] {
         lock.lock(); defer { lock.unlock() }
-        return detectAllLLMRuntimes(countSessions(readProcs()))
+        return withQuotaSamples(detectAllLLMRuntimes(countSessions(readProcs())))
+    }
+
+    /// 统一在出口处记额度采样并回填"近期速度"——全扫描与面板每秒的轻量刷新都走这里
+    private func withQuotaSamples(_ llms: [DetectedLLMRuntime]) -> [DetectedLLMRuntime] {
+        let now = Date().timeIntervalSince1970
+        let out = llms.map { var l = $0; sampleLLMQuotas(&l, now: now); return l }
+        saveSamplesIfDue(now)      // 整轮记完再落盘，别让同一轮后面的键等下一个周期
+        return out
     }
 
     // MARK: 磁盘占用与会话日志治理
@@ -2041,6 +2066,70 @@ public final class ProcessScanner {
         if let first = apiCalls.first, first.ts < horizon { apiCalls.removeAll { $0.ts < horizon } }
     }
 
+    // MARK: 额度采样（算"当前节奏"用）
+
+    /// 每个额度窗口按时间记若干 (时刻, 已用%)，用来算近期速度。
+    /// 键里带重置点 → 窗口一换就是新键，天然不会把上个窗口的样本混进来。
+    /// 落盘 `~/.config/vibegauge/quota-samples.json`，重启不丢；只留 6 小时，文件几十 KB。
+    private var qsamples: [String: [(t: TimeInterval, pct: Int)]] = [:]
+    private var qsamplesLoaded = false
+    private var qsamplesSavedAt: TimeInterval = 0
+    private var samplesPath: String { "\(home)/.config/vibegauge/quota-samples.json" }
+    private static let sampleKeep: TimeInterval = 6 * 3600
+    private static let sampleEvery: TimeInterval = 55          // 扫描每 8s 一次，别记那么密
+
+    private func loadSamples() {
+        guard !qsamplesLoaded else { return }
+        qsamplesLoaded = true
+        guard let json = readJSON(samplesPath) else { return }
+        for (k, v) in json {
+            guard let arr = v as? [[Double]] else { continue }
+            qsamples[k] = arr.compactMap { $0.count == 2 ? (t: $0[0], pct: Int($0[1])) : nil }
+        }
+    }
+
+    private func saveSamplesIfDue(_ now: TimeInterval) {
+        guard now - qsamplesSavedAt >= 120 else { return }
+        qsamplesSavedAt = now
+        var out: [String: [[Double]]] = [:]
+        for (k, arr) in qsamples { out[k] = arr.map { [$0.t, Double($0.pct)] } }
+        guard let data = try? JSONSerialization.data(withJSONObject: out) else { return }
+        try? FileManager.default.createDirectory(atPath: "\(home)/.config/vibegauge", withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: samplesPath), options: .atomic)
+    }
+
+    /// 记一笔样本，并把"近期速度"回填进窗口。lookback 内取最老的一个样本做两点差。
+    private func sampleAndFill(_ w: inout QuotaWindow, key rawKey: String, now: TimeInterval) {
+        guard let reset = w.resetsAt else { return }
+        loadSamples()
+        let key = "\(rawKey)@\(Int(reset))"
+        let pct = w.effectivePct(now: now)
+        var arr = qsamples[key] ?? []
+        if arr.last.map({ now - $0.t >= Self.sampleEvery }) ?? true {
+            arr.append((t: now, pct: pct))
+            arr.removeAll { now - $0.t > Self.sampleKeep }
+            qsamples[key] = arr
+            // 键会随窗口重置而变，老键留着没用 —— 顺手清掉超过保留期的整条
+            qsamples = qsamples.filter { !($0.value.last.map { now - $0.t > Self.sampleKeep } ?? true) }
+        }
+        // 近 1 小时内最老的样本 → 两点差。跨度不足 10 分钟就不算（噪声太大）
+        guard let oldest = arr.first(where: { now - $0.t <= 3600 }) else { return }
+        let spanSec = now - oldest.t
+        guard spanSec >= 600 else { return }
+        let delta = Double(pct - oldest.pct)
+        guard delta >= 0 else { return }                      // 只会涨；掉了说明数据源换了口径，别用
+        w.recentPctPerHour = delta / (spanSec / 3600)
+        w.recentSpanMinutes = Int(spanSec / 60)
+    }
+
+    /// 给一个平台的所有额度窗口记样本（在 scanActiveLLMs 末尾统一做，卡片与详情页都能拿到）
+    private func sampleLLMQuotas(_ llm: inout DetectedLLMRuntime, now: TimeInterval) {
+        if llm.fiveHour != nil { sampleAndFill(&llm.fiveHour!, key: "\(llm.name)|5h", now: now) }
+        if llm.sevenDay != nil { sampleAndFill(&llm.sevenDay!, key: "\(llm.name)|w", now: now) }
+        if llm.secondaryFiveHour != nil { sampleAndFill(&llm.secondaryFiveHour!, key: "\(llm.name)|sec5h", now: now) }
+        if llm.secondarySevenDay != nil { sampleAndFill(&llm.secondarySevenDay!, key: "\(llm.name)|secw", now: now) }
+    }
+
     // MARK: 记账覆盖体检（哪些 BASE_URL 没走代理）
 
     private var coverageCache: (at: TimeInterval, cov: ProxyCoverage)? = nil
@@ -2203,7 +2292,13 @@ public final class ProcessScanner {
         st.coverage = scanProxyCoverage()
         st.hasPriceTable = !prices.isEmpty
         st.priceAsOf = prices.asOf
-        st.providers = byHost.values.sorted { $0.lastTS > $1.lastTS }
+        st.providers = byHost.values.sorted { $0.lastTS > $1.lastTS }.map { p in
+            var p = p       // API 上游的额度也记采样，火山这种估算窗口同样能给"当前节奏"
+            if p.fiveHour != nil { sampleAndFill(&p.fiveHour!, key: "api|\(p.provider)|5h", now: now) }
+            if p.sevenDay != nil { sampleAndFill(&p.sevenDay!, key: "api|\(p.provider)|w", now: now) }
+            return p
+        }
+        saveSamplesIfDue(now)
         return st
     }
 

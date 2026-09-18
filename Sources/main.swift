@@ -131,6 +131,22 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(QuotaWindow(usedPct: 50, resetsAt: now + 3600, capturedAt: now).burn(now: now) == nil)
         precondition(QuotaWindow(usedPct: 50, resetsAt: now - 1, capturedAt: now, windowSeconds: 5 * 3600).burn(now: now) == nil)
         precondition(QuotaWindow(usedPct: 100, resetsAt: now + 3600, capturedAt: now, windowSeconds: 5 * 3600).burn(now: now) == nil, "已打满不推算")
+
+        // 近期速度优先：窗口均速只有 4%/h，但近 30 分钟在以 60%/h 猛烧 → 必须按近期算
+        var hot = QuotaWindow(usedPct: 20, resetsAt: now + 4 * 3600, capturedAt: now, windowSeconds: 5 * 3600)
+        hot.recentPctPerHour = 60; hot.recentSpanMinutes = 30
+        let hb = hot.burn(now: now)!
+        precondition(hb.isRecent && hb.basis == "近 30 分钟")
+        precondition(hb.projectedAtReset == 260, "20 + 60*4 = 260，实际 \(hb.projectedAtReset)")
+        precondition(hb.exhaustAt != nil && abs(hb.exhaustAt! - (now + 80.0 / 60 * 3600)) < 60)
+        // 跨度不足 10 分钟 → 噪声太大，退回窗口均速
+        var noisy = QuotaWindow(usedPct: 20, resetsAt: now + 4 * 3600, capturedAt: now, windowSeconds: 5 * 3600)
+        noisy.recentPctPerHour = 60; noisy.recentSpanMinutes = 3
+        precondition(noisy.burn(now: now)!.basis == "本窗口均")
+        // 有近期速度时，窗口刚开头也能算（不必等满 15 分钟）
+        var early = QuotaWindow(usedPct: 2, resetsAt: now + 17_700, capturedAt: now, windowSeconds: 5 * 3600)
+        early.recentPctPerHour = 12; early.recentSpanMinutes = 15
+        precondition(early.burn(now: now)?.isRecent == true)
     }
 
     // 会话日志保留期硬下限 7 天（本工具自己要读近两天的文件算额度）

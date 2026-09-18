@@ -1111,28 +1111,31 @@ public struct DashboardView: View {
 
     /// 第三行脚注：可换两行，不截断
     @ViewBuilder
-    /// 照当前速度会在重置前打满的那个窗口 → 卡片上给一句 ETA。用不完就什么都不说。
-    private func burnWarning(for llm: DetectedLLMRuntime) -> String {
+    /// 「按当前节奏会不会超额」——挑最吃紧的那个窗口，一直显示，不只是超额时才提示。
+    /// 超额的窗口优先；都不超额就显示离满最近的那个。
+    private func burnLine(for llm: DetectedLLMRuntime) -> (text: String, over: Bool)? {
         let wins: [(String, QuotaWindow?)] = [("5h", llm.fiveHour), ("周", llm.sevenDay),
-                                              ("\(llm.secondaryPoolName) 5h", llm.secondaryFiveHour),
-                                              ("\(llm.secondaryPoolName) 周", llm.secondarySevenDay)]
-        var best: (String, TimeInterval)? = nil
+                                              ("\(llm.secondaryPoolName)5h", llm.secondaryFiveHour),
+                                              ("\(llm.secondaryPoolName)周", llm.secondarySevenDay)]
+        var best: (label: String, burn: Burn)? = nil
         for (label, w) in wins {
-            guard let w = w, let b = w.burn(now: nowTS), let at = b.exhaustAt else { continue }
-            if best == nil || at < best!.1 { best = (label, at) }
+            guard let w = w, let b = w.burn(now: nowTS) else { continue }
+            if best == nil || b.projectedAtReset > best!.burn.projectedAtReset { best = (label, b) }
         }
-        guard let (label, at) = best, let eta = Fmt.countdown(to: at, now: nowTS) else { return "" }
-        return "照这速度 \(label) 约 \(eta) 后打满"
+        guard let (label, b) = best else { return nil }
+        if let at = b.exhaustAt, let eta = Fmt.countdown(to: at, now: nowTS) {
+            return ("\(label) 按当前节奏 \(eta) 后打满（重置时 \(b.projectedAtReset)%）", true)
+        }
+        return ("\(label) 按当前节奏，到重置 \(b.projectedAtReset)%", false)
     }
 
     @ViewBuilder
     private func quotaFooter(for llm: DetectedLLMRuntime) -> some View {
         let parts = footerParts(for: llm)
-        let burn = burnWarning(for: llm)
-        if !burn.isEmpty {
-            Text("⚡ " + burn)
+        if let b = burnLine(for: llm) {
+            Text((b.over ? "⚡ " : "→ ") + b.text)
                 .font(.system(size: 7))
-                .foregroundColor(.orange)
+                .foregroundColor(b.over ? .orange : .secondary)
                 .lineLimit(1)
         }
         if !parts.resets.isEmpty || !parts.stale.isEmpty {
@@ -1409,7 +1412,7 @@ public struct DashboardView: View {
             .compactMap { label, w in w?.burn(now: nowTS).map { (label, $0) } }
         if !burns.isEmpty {
             card {
-                sectionTitle("燃烧速率（本窗口迄今平均）")
+                sectionTitle("燃烧速率（优先按近期节奏）")
                 ForEach(Array(burns.enumerated()), id: \.offset) { _, item in
                     let b = item.1
                     HStack(spacing: 4) {
@@ -1417,6 +1420,9 @@ public struct DashboardView: View {
                         Spacer(minLength: 4)
                         Text(String(format: "%.1f%%/小时", b.pctPerHour))
                             .font(.system(size: 9, weight: .semibold))
+                        Text(b.basis)
+                            .font(.system(size: 7.5))
+                            .foregroundColor(b.isRecent ? .blue.opacity(0.85) : .secondary)
                         Text("→ 重置时 \(b.projectedAtReset)%")
                             .font(.system(size: 8.5))
                             .foregroundColor(b.projectedAtReset >= 100 ? .orange : .secondary)
