@@ -608,7 +608,7 @@ public final class NetworkScanner {
             readDone.signal()
         }
         if done.wait(timeout: .now() + timeout) == .timedOut {
-            log.warning("只读命令超时：\(path, privacy: .public)")
+            log.warning("只读命令超时：\(path)")
             process.terminate()
             if done.wait(timeout: .now() + 0.2) == .timedOut { kill(process.processIdentifier, SIGKILL) }
             return ""

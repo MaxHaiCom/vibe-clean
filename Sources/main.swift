@@ -205,6 +205,10 @@ if CommandLine.arguments.contains("--selftest") {
     // ssh 主机名会被拼进 shell 命令 → 只放行合法主机名
     precondition(ProcessScanner.isValidSSHHost("fixture-host"))
     precondition(ProcessScanner.isValidSSHHost("fixture@192.0.2.9"))
+    precondition(!ProcessScanner.isValidSSHHost("-Fx"))
+    precondition(!ProcessScanner.isValidSSHHost("-oProxyCommand=x"))
+    precondition(!ProcessScanner.isValidSSHHost("-fixture@host"))
+    precondition(!ProcessScanner.isValidSSHHost("fixture@-host"))
     precondition(!ProcessScanner.isValidSSHHost("fixture-host; rm -rf ~"))
     precondition(!ProcessScanner.isValidSSHHost("$(whoami)"))
     precondition(!ProcessScanner.isValidSSHHost("a`id`b"))
@@ -362,6 +366,18 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(snap.totals["API · Fixture A"]?.ctx == 30 && snap.totals["API · Fixture B"]?.ctx == 50)
         precondition(snap.cost == nil && !snap.hasPriceTable && snap.error.isEmpty)
         let cacheURL = root.appendingPathComponent(".config/vibegauge/usage-daily.json")
+        func checkCachePermissions() throws {
+            let file = try FileManager.default.attributesOfItem(atPath: cacheURL.path)
+            let dir = try FileManager.default.attributesOfItem(atPath: cacheURL.deletingLastPathComponent().path)
+            precondition(file[.posixPermissions] as? Int == 0o600 && dir[.posixPermissions] as? Int == 0o700)
+        }
+        try checkCachePermissions()
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: cacheURL.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cacheURL.deletingLastPathComponent().path)
+        // 保存有节流，重启实例并追加空行才能触发真实写入，同时保持统计结果不变。
+        try write(ca, "\n", append: true)
+        UsageHistory(home: root.path).scanNowForTesting()
+        try checkCachePermissions()
         let disk = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as! [String: Any]
         let states = disk["files"] as! [String: [String: Any]]
         let codexSize = try Data(contentsOf: root.appendingPathComponent(codexA)).count

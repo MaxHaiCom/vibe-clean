@@ -1112,11 +1112,13 @@ public final class ProcessScanner {
         var freed = 0.0
 
         for d in purgeableDirs {
+            let root = URL(fileURLWithPath: d.path).resolvingSymlinksInPath().standardizedFileURL
             guard let e = fm.enumerator(at: URL(fileURLWithPath: d.path),
-                                        includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]) else { continue }
+                                        includingPropertiesForKeys: [.isSymbolicLinkKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey]) else { continue }
             for case let url as URL in e {
-                guard url.path.hasPrefix(d.path + "/") else { continue }        // 闸 1：不出白名单目录
-                guard let v = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]),
+                guard let v = try? url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey]),
+                      v.isSymbolicLink == false,
+                      url.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(root.path + "/"), // 闸 1：解析链接后仍在白名单目录
                       v.isRegularFile == true,                                  // 闸 2：只动普通文件
                       let mt = v.contentModificationDate, mt.timeIntervalSince1970 < cutoff  // 闸 3：确实够旧
                 else { continue }
@@ -1302,7 +1304,7 @@ public final class ProcessScanner {
     /// 虽然只有本机用户能写这个 UserDefaults，但拼 shell 就该校验 —— 别给分号和反引号留门。
     public static func isValidSSHHost(_ h: String) -> Bool {
         guard !h.isEmpty, h.count <= 255 else { return false }
-        return h.range(of: #"^[A-Za-z0-9._-]+(@[A-Za-z0-9._-]+)?$"#, options: .regularExpression) != nil
+        return h.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]*(@[A-Za-z0-9][A-Za-z0-9._-]*)?$"#, options: .regularExpression) != nil
     }
 
     public func codexRemoteStatus() -> (host: String, ok: Bool, ageSeconds: Int) {
@@ -1421,13 +1423,13 @@ public final class ProcessScanner {
         guard due else { return }
         // 每个文件取：最后一条含百分比的行 + 最后一条额度耗尽事件
         let script = #"for f in $(find ~/.codex/sessions -name "*.jsonl" -mmin -2880 2>/dev/null); do tail -c 262144 "$f" | grep used_percent | tail -1; tail -c 262144 "$f" | grep usage_limit_exceeded | tail -1; done; echo __OK__"#
-        let out = execute("ssh -o BatchMode=yes -o ConnectTimeout=4 -o ServerAliveInterval=5 \(host) '\(script)' 2>/dev/null")
+        let out = execute("ssh -o BatchMode=yes -o ConnectTimeout=4 -o ServerAliveInterval=5 -- \(host) '\(script)' 2>/dev/null")
         let ok = out.contains("__OK__")
         let parsed = ok ? parseCodexText(out, fallbackTime: now) : CodexParse()
         remoteLock.lock()
         remoteCodex = ok ? (now, true, parsed) : (now, false, remoteCodex.parsed)
         remoteLock.unlock()
-        log.notice("remote codex \(host, privacy: .public) ok=\(ok) buckets=\(parsed.buckets.count) limitHit=\(parsed.limitHit != nil)")
+        log.notice("remote codex \(host) ok=\(ok) buckets=\(parsed.buckets.count) limitHit=\(parsed.limitHit != nil)")
     }
 
     private struct CodexSnapshot {
@@ -2251,8 +2253,15 @@ public final class ProcessScanner {
         var out: [String: [[Double]]] = [:]
         for (k, arr) in qsamples { out[k] = arr.map { [$0.t, Double($0.pct)] } }
         guard let data = try? JSONSerialization.data(withJSONObject: out) else { return }
-        try? FileManager.default.createDirectory(atPath: "\(home)/.config/vibegauge", withIntermediateDirectories: true)
-        try? data.write(to: URL(fileURLWithPath: samplesPath), options: .atomic)
+        do {
+            let dir = "\(home)/.config/vibegauge"
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+            try data.write(to: URL(fileURLWithPath: samplesPath), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: samplesPath)
+        } catch {
+            log.error("额度样本保存失败")
+        }
     }
 
     /// 记一笔样本，并把"近期速度"回填进窗口。lookback 内取最老的一个样本做两点差。
@@ -2515,17 +2524,45 @@ public final class ProcessScanner {
         }
         for t in confirmed { kill(pid_t(t.pid), SIGTERM) }
         usleep(300_000)
-        for t in confirmed where kill(pid_t(t.pid), 0) == 0 { kill(pid_t(t.pid), SIGKILL) }
+        lock.lock()
+        let remaining = readProcs()
+        lock.unlock()
+        for t in confirmed where kill(pid_t(t.pid), 0) == 0 {
+            // SIGTERM 后 pid 仍可能被复用，补刀也必须核对原快照。
+            guard let p = remaining[t.pid], p.ppid == 1, p.cmd == t.cmd else {
+                log.notice("SIGKILL skipped pid=\(t.pid) (已消失或 pid 被复用)")
+                continue
+            }
+            kill(pid_t(t.pid), SIGKILL)
+        }
         return (confirmed.count, skipped, confirmed.reduce(0.0) { $0 + $1.memMB })
     }
 
     public func cleanNPXCache() -> Double {
         lock.lock(); defer { lock.unlock() }
         let npxPath = "\(home)/.npm/_npx"
-        guard FileManager.default.fileExists(atPath: npxPath) else { return 0.0 }
+        let fm = FileManager.default
+        guard let attrs = try? fm.attributesOfItem(atPath: npxPath) else { return 0.0 }
+        let npxURL = URL(fileURLWithPath: npxPath)
+        let npmRoot = URL(fileURLWithPath: "\(home)/.npm").resolvingSymlinksInPath().standardizedFileURL
+        let resolved = npxURL.resolvingSymlinksInPath().standardizedFileURL
+        guard attrs[.type] as? FileAttributeType == .typeDirectory,
+              resolved.path.hasPrefix(npmRoot.path + "/") else {
+            log.error("拒绝清理 NPX 缓存：目录是符号链接或解析后越界")
+            return 0.0
+        }
         npxCache = nil
         let freedMB = npxCacheSizeMB()
-        _ = execute("/bin/rm -rf '\(npxPath)'/*")
+        do {
+            // 逐项删除不会沿子项的符号链接清理目标目录，也不需要把路径拼进 shell。
+            for url in try fm.contentsOfDirectory(at: resolved, includingPropertiesForKeys: nil) {
+                try fm.removeItem(at: url)
+            }
+        } catch {
+            log.error("NPX 缓存清理失败")
+            npxCache = nil
+            return max(0, freedMB - npxCacheSizeMB())
+        }
         npxCache = nil
         return freedMB
     }

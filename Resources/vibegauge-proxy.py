@@ -23,6 +23,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
@@ -79,14 +80,25 @@ def provider_of(host: str, path: str = "") -> str:
 
 
 def ensure_dir() -> None:
-    os.makedirs(DIR, exist_ok=True)
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    os.chmod(DIR, 0o700)
+
+
+def private_opener(path, flags):
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)  # 旧文件也可能由宽松 umask 创建，写入前一起收紧
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def append_call(rec: Dict[str, Any]) -> None:
     ensure_dir()
     line = json.dumps(rec, ensure_ascii=False)
     with _lock:
-        with open(CALLS, "a", encoding="utf-8") as f:
+        with open(CALLS, "a", encoding="utf-8", opener=private_opener) as f:
             f.write(line + "\n")
 
 
@@ -98,6 +110,26 @@ def redact_path(path: str) -> str:
     """记账只留路径，抹掉 query string —— Gemini 等把 API key 放在 ?key=... 里，写进文件就是泄露"""
     head = path.split("?", 1)[0]
     return head[:120] + ("?…" if "?" in path else "")
+
+
+def redact_text(s: str) -> str:
+    # 异常会夹带 URL、认证头或上游回显；必须先脱敏再截断，免得只截掉凭据的识别部分。
+    s = re.sub(r"\?[^\s\"']*", "?…", s)
+    s = re.sub(r"(\bBearer\s+|\b(?:key|token)\s*=\s*[\"']?)([^\s\"'&,;]+)",
+               lambda m: m[1] + m[2][:4] + "…", s, flags=re.IGNORECASE)
+    s = re.sub(r"(?<![A-Za-z0-9_-])(?:sk-(?:ant-|or-)?|ark-|AIza)[A-Za-z0-9_./+=-]+…?",
+               lambda m: m[0][:4] + "…", s)
+    return re.sub(r"(?<![A-Za-z0-9_+/-])[A-Za-z0-9_+/-]{32,}={0,2}",
+                  lambda m: m[0][:4] + "…", s)
+
+
+def log_exception(exc_type, exc, tb) -> None:
+    print(redact_text("".join(traceback.format_exception(exc_type, exc, tb))), file=sys.stderr, end="", flush=True)
+
+
+def host_matches(host: str, domain: str) -> bool:
+    h = host.lower().split(":", 1)[0]
+    return h == domain or h.endswith("." + domain)
 
 
 def capture_key(host: str, headers) -> Optional[str]:
@@ -201,12 +233,35 @@ def parse_usage(req_model: Optional[str], content_type: str, body: bytes, encodi
 
 # ---------------------------------------------------------------- 代理
 
+class ProxyServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # stdlib 默认会把未捕获异常直接打进 stderr（LaunchAgent 的 proxy.log）。
+        log_exception(*sys.exc_info())
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "VibeGaugeProxy/1"
 
     def log_message(self, fmt, *args):  # 安静
         pass
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        port = self.server.server_address[1]
+        hosts = self.headers.get_all("Host", [])
+        # 只拦浏览器专属的头：Origin、Sec-Fetch-Site、Sec-Fetch-Dest。
+        # 不能拦整个 Sec-Fetch-*：Node 自带的 fetch（undici）默认会发 sec-fetch-mode，
+        # 拦了就会把 Gemini CLI 这类 Node 工具经代理的请求全部 403（2026-09-19 实测）。
+        browser = {"origin", "sec-fetch-site", "sec-fetch-dest"}
+        if (any(k.lower() in browser for k in self.headers)
+                or len(hosts) != 1 or hosts[0] not in ("127.0.0.1:%d" % port, "localhost:%d" % port)):
+            # 拒绝后关连接，未读取的请求体不能被当成下一条请求。
+            self.close_connection = True
+            self._json(403, {"error": "vibegauge-proxy requires a local CLI request"})
+            return False
+        return True
 
     def do_GET(self): self._proxy()
     def do_POST(self): self._proxy()
@@ -274,23 +329,25 @@ class Handler(BaseHTTPRequestHandler):
 
         t0 = time.time()
         conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-        conn = conn_cls(hostport, timeout=600)
+        conn = None
         rec: Dict[str, Any] = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z", "epoch": round(t0, 3),
                                "host": hostport, "provider": provider_of(hostport, rest), "path": redact_path(rest),
                                "model": req_model, "stream": stream, "key": key_fp}
         try:
+            conn = conn_cls(hostport, timeout=600)
             conn.request(self.command, rest, body=body, headers=hdrs)
             resp = conn.getresponse()
         except Exception as e:
-            conn.close()
-            rec.update({"status": 502, "ms": int((time.time() - t0) * 1000), "error": str(e)[:200], "parsed": False,
+            if conn is not None:
+                conn.close()
+            rec.update({"status": 502, "ms": int((time.time() - t0) * 1000), "error": redact_text(str(e))[:200], "parsed": False,
                         "ctx": 0, "cache_read": 0, "cache_write": 0, "out": 0, "think": 0})
             if record:
                 with _lock:
                     _stats["calls"] += 1
                     _stats["errors"] += 1
                 append_call(rec)
-            return self._json(502, {"error": "vibegauge-proxy upstream error: %s" % e})
+            return self._json(502, {"error": "vibegauge-proxy upstream error: %s" % type(e).__name__})
 
         clen = resp.getheader("Content-Length")
         chunked = clen is None
@@ -354,7 +411,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------- 额度 / 余额探针
-# 每个探针：(host 子串, 函数)。函数拿到该 host 的请求头 dict，返回 dict；查不到就 {"error": ...}。
+# 每个探针：(域名, 函数)。只匹配该域名及其子域，避免把中转站的 key 发给官方。
 # 只放有公开文档 / 已实测的接口，没有的厂商不猜。
 
 def _get_json(host: str, path: str, headers: Dict[str, str], timeout: int = 15) -> Any:
@@ -364,7 +421,7 @@ def _get_json(host: str, path: str, headers: Dict[str, str], timeout: int = 15) 
         r = conn.getresponse()
         raw = r.read()
         if r.status >= 400:
-            raise RuntimeError("HTTP %d %s" % (r.status, raw[:120].decode("utf-8", "replace")))
+            raise RuntimeError("HTTP %d %s" % (r.status, redact_text(raw.decode("utf-8", "replace"))[:120]))
         return json.loads(raw)
     finally:
         conn.close()
@@ -405,7 +462,7 @@ def probe_glm(hdrs):
     host = "open.bigmodel.cn"
     j = _get_json(host, "/api/monitor/usage/quota/limit", _bearer(hdrs))
     if j.get("code") != 200 or not isinstance(j.get("data"), dict):
-        return {"kind": "quota", "error": str(j.get("msg") or j)[:120]}
+        return {"kind": "quota", "error": redact_text(str(j.get("msg") or j))[:120]}
     d = j["data"]
     limits = [l for l in (d.get("limits") or []) if isinstance(l, dict) and l.get("percentage") is not None]
     limits.sort(key=lambda l: l.get("nextResetTime") or 0)
@@ -423,7 +480,7 @@ def probe_minimax(hdrs):
     j = _get_json("api.minimaxi.com", "/v1/token_plan/remains", _bearer(hdrs))
     d = j.get("data") or {}
     if not d:
-        return {"kind": "quota", "error": str(j.get("message") or j)[:120]}
+        return {"kind": "quota", "error": redact_text(str(j.get("message") or j))[:120]}
     now = time.time()
     windows: Dict[str, Any] = {}
     tot, used = d.get("current_interval_total_count"), d.get("current_interval_usage_count")
@@ -440,7 +497,7 @@ def probe_kimi_code(hdrs):
     j = _get_json("api.kimi.com", "/coding/v1/usages", _bearer(hdrs))
     u = j.get("usage") or {}
     if not u:
-        return {"kind": "quota", "error": str(j)[:120]}
+        return {"kind": "quota", "error": redact_text(str(j))[:120]}
     limit, used = float(u.get("limit") or 0), float(u.get("used") or 0)
     windows: Dict[str, Any] = {}
     if limit > 0:
@@ -468,7 +525,7 @@ def probe_openrouter(hdrs):
         if total is not None and used is not None:
             out["balance"] = round(float(total) - float(used), 4)
     except Exception as e:  # /credits 需要管理 key，拿不到就只报 usage
-        out["credits_error"] = str(e)[:120]
+        out["credits_error"] = redact_text(str(e))[:120]
     return out
 
 
@@ -507,19 +564,19 @@ def quota_loop() -> None:
         changed = False
         for host, hdrs in snapshot.items():
             for sub, fn in PROBES:
-                if sub not in host:
+                if not host_matches(host, sub):
                     continue
                 entry = {"provider": provider_of(host), "captured_at": time.time()}
                 try:
                     entry.update(fn(hdrs))
                 except Exception as e:
-                    entry["error"] = str(e)[:160]
+                    entry["error"] = redact_text(str(e))[:160]
                 result[host] = entry
                 changed = True
         if changed:
             ensure_dir()
             tmp = QUOTA + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8", opener=private_opener) as f:
                 json.dump(result, f, ensure_ascii=False, indent=1)
             os.replace(tmp, QUOTA)
 
@@ -527,8 +584,11 @@ def quota_loop() -> None:
 # ---------------------------------------------------------------- 自测
 
 def selftest() -> None:
-    import socketserver
+    import contextlib
+    import io
+    import socket
     import tempfile
+    from unittest.mock import patch
     global DIR, CALLS, QUOTA
     DIR = tempfile.mkdtemp(prefix="vibegauge-selftest-")
     CALLS, QUOTA = os.path.join(DIR, "api-calls.jsonl"), os.path.join(DIR, "api-quota.json")
@@ -574,7 +634,7 @@ def selftest() -> None:
     mock = ThreadingHTTPServer(("127.0.0.1", 0), Mock)
     mport = mock.server_address[1]
     threading.Thread(target=mock.serve_forever, daemon=True).start()
-    proxy = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    proxy = ProxyServer(("127.0.0.1", 0), Handler)
     pport = proxy.server_address[1]
     threading.Thread(target=proxy.serve_forever, daemon=True).start()
 
@@ -594,13 +654,102 @@ def selftest() -> None:
     h = json.loads(c.getresponse().read())
     assert h["ok"] and h["calls"] == 2 and h["parsed"] == 2, h
     c.request("GET", "/nonsense")
-    assert c.getresponse().status == 400
+    r = c.getresponse()
+    assert r.status == 400
+    r.read()
+
+    # Node fetch 只带 sec-fetch-mode：必须放行，否则 Node 系 CLI 经代理全挂
+    # 用不记账的健康检查测放行，免得多出一次调用把后面的计数断言弄坏
+    c.request("GET", "/_vibegauge/health", headers={"sec-fetch-mode": "cors"})
+    r = c.getresponse()
+    assert r.status == 200, "Node fetch 的 sec-fetch-mode 被误拦: %d" % r.status
+    r.read()
+    c.close()
+    for headers in ({"Origin": "https://example.test"}, {"Origin": ""}, {"sEc-FeTcH-SiTe": "cross-site"},
+                    {"Sec-Fetch-Dest": "empty"},
+                    {"Host": "example.test:%d" % pport}, {"Host": "127.0.0.1:1"}):
+        c.request("POST", "/http://127.0.0.1:%d/v1/chat/completions" % mport, body="{}", headers=headers)
+        r = c.getresponse()
+        assert r.status == 403, headers
+        r.read()
+        c.close()
+    for hosts in ([], ["127.0.0.1:%d" % pport, "example.test:%d" % pport]):
+        c.putrequest("GET", "/_vibegauge/health", skip_host=True)
+        for host in hosts:
+            c.putheader("Host", host)
+        c.endheaders()
+        r = c.getresponse()
+        assert r.status == 403
+        r.read()
+        c.close()
+    c.request("GET", "/_vibegauge/health", headers={"Host": "localhost:%d" % pport})
+    r = c.getresponse()
+    assert r.status == 200 and json.loads(r.read())["calls"] == 2
+    c.close()
+
+    fake_key = "AIzaFAKE" + "x" * 32
+    # 原始 socket 才能把控制字符送到代理，http.client 自己会先拦住这条回归用例。
+    with socket.create_connection(("127.0.0.1", pport), timeout=10) as sock:
+        path = "/http://127.0.0.1:%d/v1/messages?key=%s\x01" % (mport, fake_key)
+        sock.sendall(("POST %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" % (path, pport)).encode())
+        r = http.client.HTTPResponse(sock)
+        r.begin()
+        error_body = r.read().decode()
+        assert r.status == 502 and json.loads(error_body)["error"] == "vibegauge-proxy upstream error: InvalidURL", error_body
+        assert "AIzaFAKE" not in error_body
 
     assert redact_path("/v1beta/models/gemini-3-pro:generateContent?key=AIzaSECRET") == "/v1beta/models/gemini-3-pro:generateContent?…"
     assert redact_path("/v1/messages") == "/v1/messages"
+    assert redact_text("bad '/v1/messages?key=%s' suffix" % fake_key) == "bad '/v1/messages?…' suffix"
+    for token in ("sk-FAKEabcdef", "sk-ant-FAKEabcdef", "sk-or-FAKEabcdef", "ark-FAKEabcdef", fake_key,
+                  "0123456789abcdef" * 2, "Ab9+/cdE" * 4, "Ab9_-cdE" * 4):
+        assert redact_text(token) == token[:4] + "…", token
+    for label in ("Bearer ", "key=", "token=", "TOKEN='", "Key=\""):
+        assert redact_text(label + "FAKEabcdef") == label + "FAKE…", label
+    assert host_matches("deepseek.com", "deepseek.com")
+    assert host_matches("API.DeepSeek.com:443", "deepseek.com")
+    assert not host_matches("deepseek.com.gateway.example:443", "deepseek.com")
+    assert not host_matches("notdeepseek.com", "deepseek.com")
+    with patch.object(http.client, "HTTPSConnection") as connection:
+        response = connection.return_value.getresponse.return_value
+        response.status = 401
+        response.read.return_value = ("bad key=" + fake_key).encode()
+        try:
+            _get_json("example.test", "/quota", {})
+            assert False, "上游错误必须抛出异常"
+        except RuntimeError as e:
+            assert "AIzaFAKE" not in str(e) and "HTTP 401" in str(e)
+    with contextlib.redirect_stderr(io.StringIO()) as captured:
+        try:
+            raise ValueError("bad token=" + fake_key)
+        except ValueError:
+            proxy.handle_error(None, None)
+    assert "ValueError" in captured.getvalue() and "AIzaFAKE" not in captured.getvalue()
+
+    # 既验证新建权限，也验证下次写入会修复旧文件的宽松权限。
+    os.chmod(DIR, 0o755)
+    os.chmod(CALLS, 0o644)
+    append_call({"selftest": True})
+    assert os.stat(DIR).st_mode & 0o777 == 0o700
+    assert os.stat(CALLS).st_mode & 0o777 == 0o600
+    for path in (QUOTA + ".tmp", os.path.join(DIR, "proxy.log")):
+        with open(path, "w", encoding="utf-8", opener=private_opener) as f:
+            f.write("{}")
+        assert os.stat(path).st_mode & 0o777 == 0o600
+        os.chmod(path, 0o644)
+        with open(path, "a", encoding="utf-8", opener=private_opener):
+            pass
+        assert os.stat(path).st_mode & 0o777 == 0o600
+    with open(QUOTA, "w", encoding="utf-8") as f:
+        f.write("{}")
+    os.chmod(QUOTA, 0o644)
+    os.replace(QUOTA + ".tmp", QUOTA)
+    assert os.stat(QUOTA).st_mode & 0o777 == 0o600
 
     recs = [json.loads(l) for l in open(CALLS, encoding="utf-8")]
     a, o = recs[0], recs[1]
+    assert len(recs) == 4 and recs[2]["status"] == 502, recs
+    assert "AIzaFAKE" not in recs[2]["error"] and "?…" in recs[2]["error"], recs[2]
     assert a["provider"] == "本地" and a["model"] == "glm-4.7" and a["stream"] is True
     assert a["ctx"] == 17 and a["cache_read"] == 5 and a["cache_write"] == 2 and a["out"] == 7 and a["parsed"], a
     assert o["ctx"] == 100 and o["cache_read"] == 60 and o["out"] == 20 and o["think"] == 4 and o["parsed"], o
@@ -608,7 +757,7 @@ def selftest() -> None:
                            "x-ratelimit-reset-requests": "6m0s"}, o.get("rl")     # 只收限流头，别的头不收
     assert "rl" not in a, "上游没给限流头就不该有这个字段"
     assert _keys.get("127.0.0.1:%d" % mport, {}).get("authorization") == "Bearer test"   # 同一 host 后到的 key 覆盖
-    print("selftest OK: 流式 Anthropic + 非流式 OpenAI 解析正确 + 限流头被动抓取, 记录", CALLS)
+    print("selftest OK: 流式/非流式 + 限流头 + 异常脱敏 + 来源/Host 校验 + 探针域名 + 文件权限, 记录", CALLS)
     # 先停服务线程再退出：否则守护线程在解释器收尾时还握着 stderr 锁，
     # 会报 "Fatal Python error: _enter_buffered_busy"、退出码 134，CI 就红了（断言其实全过）
     proxy.shutdown(); mock.shutdown()
@@ -617,12 +766,16 @@ def selftest() -> None:
 
 
 def main() -> None:
+    sys.excepthook = log_exception
+    threading.excepthook = lambda args: log_exception(args.exc_type, args.exc_value, args.exc_traceback)
     if "--selftest" in sys.argv:
         selftest()
         return
     ensure_dir()
+    with open(os.path.join(DIR, "proxy.log"), "a", encoding="utf-8", opener=private_opener):
+        pass
     threading.Thread(target=quota_loop, daemon=True).start()
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv = ProxyServer(("127.0.0.1", PORT), Handler)
     srv.daemon_threads = True
     print("vibegauge-proxy listening on 127.0.0.1:%d, dir=%s" % (PORT, DIR), flush=True)
     try:

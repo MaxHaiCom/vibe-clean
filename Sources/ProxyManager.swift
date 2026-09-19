@@ -53,10 +53,22 @@ final class ProxyManager {
         guard let src = bundledScript else {
             throw NSError(domain: "VibeGauge", code: 1, userInfo: [NSLocalizedDescriptionKey: "App 包里没有 vibegauge-proxy.py（build.sh 没拷？）"])
         }
-        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+        // launchd 会先打开日志再启动 Python，预先建好才能从第一行起就是私有文件。
+        if !FileManager.default.fileExists(atPath: logPath) {
+            guard FileManager.default.createFile(atPath: logPath, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logPath)
         let new = try Data(contentsOf: URL(fileURLWithPath: src))
-        if let old = try? Data(contentsOf: URL(fileURLWithPath: scriptPath)), old == new { return false }
+        if let old = try? Data(contentsOf: URL(fileURLWithPath: scriptPath)), old == new {
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptPath)
+            return false
+        }
         try new.write(to: URL(fileURLWithPath: scriptPath))
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptPath)
         return true
     }
 

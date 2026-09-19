@@ -396,7 +396,8 @@ public final class UsageHistory {
     private func saveCache() {
         do {
             let url = URL(fileURLWithPath: cachePath)
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.deletingLastPathComponent().path)
             try JSONEncoder().encode(cache).write(to: url, options: [.atomic])
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: cachePath)
         } catch { errors.insert("历史缓存保存失败，重启后需重新汇总") }
