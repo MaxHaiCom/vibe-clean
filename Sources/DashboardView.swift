@@ -67,7 +67,7 @@ struct SwipeScroll<Content: View>: NSViewRepresentable {
 
     func makeNSView(context: Context) -> SwipeScrollView {
         let sv = SwipeScrollView()
-        sv.hasVerticalScroller = true
+        sv.hasVerticalScroller = false          // 用户不要侧边滚动条；触控板照样能滚
         sv.autohidesScrollers = true
         sv.drawsBackground = false
         sv.onSwipe = onSwipe
