@@ -100,6 +100,7 @@ public struct PanelActions {
     public var setAutoClean: (Bool) -> Void = { _ in }
     public var setLaunchAtLogin: (Bool) -> Void = { _ in }
     public var setThresholdNotify: (Bool) -> Void = { _ in }
+    public var setExitChangeNotify: (Bool) -> Void = { _ in }
     public var installProxy: () -> Void = {}
     public var uninstallProxy: () -> Void = {}
     public var copyProxyPrefix: () -> Void = {}
@@ -113,14 +114,16 @@ public struct PanelSettings {
     public var autoClean: Bool = false
     public var launchAtLogin: Bool = false
     public var thresholdNotify: Bool = true
-    public init(autoClean: Bool = false, launchAtLogin: Bool = false, thresholdNotify: Bool = true) {
+    public var exitChangeNotify: Bool = true
+    public init(autoClean: Bool = false, launchAtLogin: Bool = false, thresholdNotify: Bool = true, exitChangeNotify: Bool = true) {
         self.autoClean = autoClean
         self.launchAtLogin = launchAtLogin
         self.thresholdNotify = thresholdNotify
+        self.exitChangeNotify = exitChangeNotify
     }
 }
 
-/// 菜单里的面板：顶部 Tab 切换（订阅 / API / 系统），高度随当前 Tab 内容自适应（实测 macOS 14 NSMenu 会跟着
+/// 菜单里的面板：顶部 Tab 切换（订阅 / API / 统计 / 网络 / 系统），高度随当前 Tab 内容自适应（实测 macOS 14 NSMenu 会跟着
 /// 自定义视图的 frame 实时重排），只有超过屏幕可用高度才在内部滚动。
 public struct DashboardView: View {
     public var report: ScanReport
@@ -137,6 +140,7 @@ public struct DashboardView: View {
     @State private var autoCleanOn: Bool
     @State private var launchAtLoginOn: Bool
     @State private var notifyOn: Bool
+    @State private var exitNotifyOn: Bool
 
     @State private var liveNow: Date = Date()
     @State private var pulseAnim: Bool = false
@@ -145,15 +149,26 @@ public struct DashboardView: View {
     @State private var dynamicAPI: ProxyStatus? = nil
     @State private var dynamicCLI: [CLIUsage]? = nil
     @State private var refreshing: Bool = false
+    @State private var network = NetworkSnapshot()
+    @State private var history = UsageHistory.Snapshot()
 
     private let liveTicker = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     public init(report: ScanReport, settings: PanelSettings, actions: PanelActions) {
+        Self.migrateTabSelection()
         self.report = report
         self.actions = actions
         _autoCleanOn = State(initialValue: settings.autoClean)
         _launchAtLoginOn = State(initialValue: settings.launchAtLogin)
         _notifyOn = State(initialValue: settings.thresholdNotify)
+        _exitNotifyOn = State(initialValue: settings.exitChangeNotify)
+    }
+
+    /// 旧索引 2 是系统页；只迁移一次，之后用户主动选择统计页不会被改回去。
+    static func migrateTabSelection(defaults: UserDefaults = .standard) {
+        guard !defaults.bool(forKey: "vg.fiveTabsMigrated") else { return }
+        if defaults.integer(forKey: "vg.tab") == 2 { defaults.set(4, forKey: "vg.tab") }
+        defaults.set(true, forKey: "vg.fiveTabsMigrated")
     }
 
     private var nowTS: TimeInterval { liveNow.timeIntervalSince1970 }
@@ -321,6 +336,9 @@ public struct DashboardView: View {
     }
 
     private func refreshLive() {
+        // 新采集器独立节流，只读 O(1) 快照；旧扫描较慢时进度与网络页仍每秒刷新。
+        network = NetworkScanner.shared.snapshot()
+        history = UsageHistory.shared.snapshot()
         guard !refreshing else { return }   // 上一次还没回来就跳过这一拍，不堆积
         refreshing = true
         DispatchQueue.global(qos: .userInitiated).async {
@@ -366,12 +384,14 @@ public struct DashboardView: View {
                     Picker("", selection: $tab) {
                         Text("订阅").tag(0)
                         Text("API").tag(1)
-                        Text("系统").tag(2)
+                        Text("统计").tag(2)
+                        Text("网络").tag(3)
+                        Text("系统").tag(4)
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
                     .controlSize(.small)
-                    .frame(width: 150)
+                    .frame(width: 222)
                     .help("也可以在面板上用触控板左右滑动切换")
 
                     Spacer()
@@ -395,7 +415,9 @@ public struct DashboardView: View {
                     } else {
                         switch tab {
                         case 1: apiSection
-                        case 2:
+                        case 2: StatsTabView(snapshot: history)
+                        case 3: NetworkTabView(snapshot: network, onRetest: { NetworkScanner.shared.forceRefresh() })
+                        case 4:
                             actionSection
                             hardwareSection
                             diskSection
@@ -407,7 +429,7 @@ public struct DashboardView: View {
                 .frame(width: Self.panelWidth - 24, alignment: .leading),
                 onSwipe: { step in
                     guard drillDown == nil else { return }   // 详情页里不响应滑动，只用「返回」按钮
-                    let next = max(0, min(2, tab + step))
+                    let next = max(0, min(4, tab + step))
                     if next != tab { tab = next }
                 },
                 onHeight: { h in if abs(h - measuredHeight) > 1 { measuredHeight = h } }
@@ -427,14 +449,16 @@ public struct DashboardView: View {
         .onAppear { refreshLive() }
     }
 
-    /// Tab 栏右侧：其他两个 Tab 的一句话摘要，切过去之前也能看到大概
+    /// Tab 栏右侧只留紧凑摘要，五个入口仍能在菜单栏宽度内完整显示。
     private var tabStatusText: String {
         let active = currentLLMs.filter { $0.isRunning }.count
         let calls = currentAPI.providers.reduce(0) { $0 + $1.calls }
         switch tab {
-        case 1: return "\(active) 平台活跃 · 内存 \(report.freePercentage)%"
-        case 2: return "\(active) 平台活跃 · API 今日 \(calls) 次"
-        default: return "内存 \(report.freePercentage)% 可用 · API 今日 \(calls) 次"
+        case 1: return "今日 \(calls) 次"
+        case 2: return history.isScanning ? "汇总中" : "\(history.activeDays) 活跃天"
+        case 3: return "\(network.aiExits.filter { !$0.isGemini && !$0.ip.isEmpty && $0.error.isEmpty }.count)/4 出口"
+        case 4: return "\(active) 平台活跃"
+        default: return "内存可用 \(report.freePercentage)%"
         }
     }
 
@@ -961,6 +985,8 @@ public struct DashboardView: View {
                        isOn: Binding(get: { launchAtLoginOn }, set: { launchAtLoginOn = $0; actions.setLaunchAtLogin($0) }))
             settingRow("阈值通知", detail: "额度 80/95%、内存 85/93%、磁盘 90/96% 越线时提醒一次",
                        isOn: Binding(get: { notifyOn }, set: { notifyOn = $0; actions.setThresholdNotify($0) }))
+            settingRow("出口变化通知", detail: "AI 出口 IP 或国家变化时提醒，每家 10 分钟最多一次",
+                       isOn: Binding(get: { exitNotifyOn }, set: { exitNotifyOn = $0; actions.setExitChangeNotify($0) }))
         }
         .padding(10)
         .background(Color.secondary.opacity(0.06))
@@ -1172,8 +1198,6 @@ public struct DashboardView: View {
         return (resets.isEmpty ? "" : "重置 " + resets.joined(separator: " · "), stale.joined(separator: " · "))
     }
 
-    /// 第三行脚注：可换两行，不截断
-    @ViewBuilder
     /// 「按当前节奏会不会超额」——挑最吃紧的那个窗口，一直显示，不只是超额时才提示。
     /// 超额的窗口优先；都不超额就显示离满最近的那个。
     private func burnLine(for llm: DetectedLLMRuntime) -> (text: String, over: Bool)? {
@@ -1192,6 +1216,7 @@ public struct DashboardView: View {
         return ("\(label) 按当前节奏，到重置 \(b.projectedAtReset)%", false)
     }
 
+    /// 第三行脚注：节奏预测 + 重置/陈旧提示，可换两行，不截断
     @ViewBuilder
     private func quotaFooter(for llm: DetectedLLMRuntime) -> some View {
         let parts = footerParts(for: llm)

@@ -860,8 +860,8 @@ public final class ProcessScanner {
 
     // MARK: 全量扫描（8s 定时器）
 
-    public func scan() -> ScanReport {
-        refreshRemoteCodexIfDue()          // ssh 可能要几秒，放在锁外，不挡 ticker
+    public func scan(refreshRemote: Bool = true) -> ScanReport {
+        if refreshRemote { refreshRemoteCodexIfDue() }  // 自测只扫描本机，不为验收触发远程 SSH
         lock.lock(); defer { lock.unlock() }
         var report = ScanReport()
 

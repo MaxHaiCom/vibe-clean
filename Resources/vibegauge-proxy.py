@@ -609,6 +609,11 @@ def selftest() -> None:
     assert "rl" not in a, "上游没给限流头就不该有这个字段"
     assert _keys.get("127.0.0.1:%d" % mport, {}).get("authorization") == "Bearer test"   # 同一 host 后到的 key 覆盖
     print("selftest OK: 流式 Anthropic + 非流式 OpenAI 解析正确 + 限流头被动抓取, 记录", CALLS)
+    # 先停服务线程再退出：否则守护线程在解释器收尾时还握着 stderr 锁，
+    # 会报 "Fatal Python error: _enter_buffered_busy"、退出码 134，CI 就红了（断言其实全过）
+    proxy.shutdown(); mock.shutdown()
+    proxy.server_close(); mock.server_close()
+    sys.stdout.flush(); sys.stderr.flush()
 
 
 def main() -> None:

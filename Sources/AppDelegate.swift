@@ -48,6 +48,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         loadNotifyState()
+        DashboardView.migrateTabSelection()
+        NetworkScanner.shared.start()
+        UsageHistory.shared.start()
         DispatchQueue.global(qos: .utility).async { ProxyManager.shared.syncIfInstalled() }   // 包里脚本更新了就热替换
         updateStatus()
 
@@ -136,7 +139,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var scrollMonitor: Any?
     private var swipeAccum: CGFloat = 0
     private var lastSwipeAt: TimeInterval = 0
-    private static let tabCount = 3
+    private static let tabCount = 5
 
     private func installSwipeMonitor() {
         guard scrollMonitor == nil else { return }
@@ -274,6 +277,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 图标仍然只画内存可用 %（不掺额度，免得菜单栏变成花的）。
     /// 压力信号只走两条出口：越线弹通知 + 悬停 tooltip 里列全部。
     private func renderStatusButton(report: ScanReport) {
+        evaluateExitChanges()
         guard let button = statusItem.button else { return }
         button.image = renderChipFrameImage(percentage: report.freePercentage)
         button.imagePosition = .imageOnly
@@ -297,6 +301,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var isThresholdNotifyEnabled: Bool {
         get { UserDefaults.standard.object(forKey: notifyKey) == nil ? true : UserDefaults.standard.bool(forKey: notifyKey) }
         set { UserDefaults.standard.set(newValue, forKey: notifyKey) }
+    }
+
+    var isExitChangeNotifyEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "exitChangeNotifyEnabled") == nil ? true : UserDefaults.standard.bool(forKey: "exitChangeNotifyEnabled") }
+        set { UserDefaults.standard.set(newValue, forKey: "exitChangeNotifyEnabled") }
+    }
+
+    static func shouldNotifyExit(lastAt: TimeInterval?, now: TimeInterval) -> Bool {
+        lastAt.map { now - $0 >= 600 } ?? true
+    }
+
+    private func evaluateExitChanges() {
+        let events = NetworkScanner.shared.drainExitEvents()
+        guard isExitChangeNotifyEnabled else { return }  // 关闭期间的变化不在重新打开时补报
+        let defaults = UserDefaults.standard
+        for event in events {
+            let key = "vg.exitNotifiedAt.\(event.aiName)"
+            let now = Date().timeIntervalSince1970
+            let last = defaults.object(forKey: key) as? Double
+            guard Self.shouldNotifyExit(lastAt: last, now: now) else { continue }
+            defaults.set(now, forKey: key)
+            sendNotification(title: (event.isCountryChange ? "⛔️ " : "⚠️ ") + "\(event.aiName) 出口变化",
+                             body: "\(event.oldIP)（\(event.oldLoc)）→ \(event.newIP)（\(event.newLoc)）")
+        }
     }
 
     private func evaluateThresholds(_ signals: [PressureSignal]) {
@@ -379,6 +407,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         actions.setAutoClean = { [weak self] on in self?.isAutoCleanEnabled = on }
         actions.setLaunchAtLogin = { [weak self] on in self?.setLaunchAtLogin(on) }
         actions.setThresholdNotify = { [weak self] on in self?.isThresholdNotifyEnabled = on }
+        actions.setExitChangeNotify = { [weak self] on in self?.isExitChangeNotifyEnabled = on }
         actions.installProxy = { [weak self] in
             self?.menu.cancelTracking()
             self?.installProxy()
@@ -398,7 +427,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             report: report,
             settings: PanelSettings(autoClean: isAutoCleanEnabled,
                                     launchAtLogin: isLaunchAtLoginEnabled(),
-                                    thresholdNotify: isThresholdNotifyEnabled),
+                                    thresholdNotify: isThresholdNotifyEnabled,
+                                    exitChangeNotify: isExitChangeNotifyEnabled),
             actions: actions
         )
 

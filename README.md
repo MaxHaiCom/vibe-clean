@@ -45,7 +45,7 @@ When using autonomous coding agents like **Claude Code**, **OpenAI Codex**, **Go
 3. **📊 Token Costs & Prompt Cache Black Hole**:
    How many tokens did you burn today? Is Prompt Caching actually hitting 95%+ to save your budget? How much thinking/reasoning token overhead was generated?
 
-**VibeGauge** is built entirely with native **Swift + AppKit + SwiftUI**. It is lightweight (~15MB RAM), has **zero third-party dependencies, zero cloud uploads, and performs 100% local, read-only inspection**.
+**VibeGauge** is built entirely with native **Swift + AppKit + SwiftUI**. It has **zero third-party dependencies and no prompt or usage-log uploads**. Usage analysis stays local; the Network tab makes only the trace requests documented below.
 
 ---
 
@@ -134,6 +134,21 @@ All subscription tiers, quotas, and token metrics are read strictly from local s
 
 ---
 
+## Network and Historical Statistics
+
+The panel has five tabs: **Subscriptions / API / Statistics / Network / System**.
+
+- **Network** probes only each AI domain's `/cdn-cgi/trace` endpoint (Anthropic, ChatGPT, OpenAI API and Grok), once per minute with fresh connections. Gemini has no trace endpoint; its route is shown only when the local clash connection table contains an active connection. Failures remain visible as unavailable.
+- The local clash API is read every 10 seconds (`clashAPI`, default `http://127.0.0.1:9090`; optional `clashSecret`). Only loopback addresses are accepted. Local interface, route and DNS information refresh every 30 seconds; byte counters are sampled at least two seconds apart. No network configuration is changed.
+- Every 10 minutes, an IPv6-only request to Cloudflare's trace endpoint checks IPv6 reachability, and local resolver addresses are checked for possible DNS leakage. These are indicators, not proof that all traffic follows the same route. Exit-change notifications are enabled by default, with a 10-minute cooldown per AI.
+- **Statistics** reads local Claude, Codex and API proxy logs in the background, then updates incrementally every five minutes. Claude requests are deduplicated across files; Codex uses per-request usage when available and cumulative differences otherwise. Events are grouped by their timestamps in the local timezone.
+- History is stored in `~/.config/vibegauge/usage-daily.json`. Removing old logs retains their already-cached history; rewriting a file replaces its contribution. Session counts are distinct log files. CLI and API proxy sources can include the same call and are not deduplicated against each other.
+- API-equivalent cost uses only `~/.config/vibegauge/prices.json`. Unpriced models are explicitly excluded; there are no built-in production prices. Token totals include cached input and output; reasoning tokens are part of output.
+
+No prompts or usage logs are uploaded by these features. Network probes necessarily make the outbound requests described above. The optional existing API proxy and remote Codex synchronization retain their own behavior. `--selftest` skips remote SSH, exercises parsing and incremental-cache fixtures, and prints masked network and real historical summaries.
+
+---
+
 ## 🛠️ API Key Accounting Proxy (Optional)
 
 When routing terminal tools or scripts directly to AI provider endpoints, route requests through the local proxy to capture token analytics and credit balances:
@@ -171,7 +186,7 @@ When routing terminal tools or scripts directly to AI provider endpoints, route 
 
 - 🔒 **100% Local Execution**: No analytics, no telemetry, no remote servers. Your token counts and usage data never leave your Mac.
 - 🔑 **Zero Key Disk Logging**: API keys processed by the local proxy remain strictly in volatile process memory for upstream balance checks. Recorded logs only store an 8-character SHA-256 fingerprint; URL query parameters are stripped.
-- ⚙️ **Non-Intrusive**: VibeGauge only reads local logs. It does not tamper with OAuth credentials, proxy your login sessions, or modify vendor configurations.
+- ⚙️ **Non-Intrusive**: VibeGauge reads local logs and network settings, and makes the documented trace probes. It does not tamper with OAuth credentials, proxy your login sessions, or modify vendor or system network configurations.
 - 🛡️ **Whitelisted Safe Reaping**: The process cleaner strictly enforces multi-criteria verification before terminating orphaned processes.
 
 ---

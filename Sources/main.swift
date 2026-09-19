@@ -203,15 +203,199 @@ if CommandLine.arguments.contains("--selftest") {
     precondition(ProcessScanner.effectiveRetention(-99) == 7)
 
     // ssh 主机名会被拼进 shell 命令 → 只放行合法主机名
-    precondition(ProcessScanner.isValidSSHHost("mac-mini"))
-    precondition(ProcessScanner.isValidSSHHost("user@192.168.1.9"))
-    precondition(!ProcessScanner.isValidSSHHost("mac-mini; rm -rf ~"))
+    precondition(ProcessScanner.isValidSSHHost("fixture-host"))
+    precondition(ProcessScanner.isValidSSHHost("fixture@192.0.2.9"))
+    precondition(!ProcessScanner.isValidSSHHost("fixture-host; rm -rf ~"))
     precondition(!ProcessScanner.isValidSSHHost("$(whoami)"))
     precondition(!ProcessScanner.isValidSSHHost("a`id`b"))
     precondition(!ProcessScanner.isValidSSHHost(""))
 
+    // 网络解析只用文档地址；不把本机出口、节点或账户信息写进测试。
+    do {
+        let trace = parseTrace("fl=fixture\nip=192.0.2.7\nloc=US\ncolo=SJC\n")!
+        precondition(trace.ip == "192.0.2.7" && trace.loc == "US" && trace.colo == "SJC")
+        precondition(parseTrace(" colo=NRT\r\nloc=JP\r\nip=198.51.100.8\r\n")?.colo == "NRT")
+        precondition(parseTrace("ip=not-an-ip\nloc=US\ncolo=SJC") == nil)
+        precondition(parseTrace("ip=192.0.2.7\nloc=US") == nil)
+        precondition(parseTrace("<html>unavailable</html>") == nil)
+        precondition(rate(prev: UInt64(100), cur: 300, dt: 2) == 100)
+        precondition(rate(prev: UInt64(100), cur: 100, dt: 2) == 0)
+        precondition(rate(prev: UInt64.max, cur: 2, dt: 2) == nil)
+        precondition(rate(prev: UInt64(100), cur: 1, dt: 2) == nil)
+        precondition(rate(prev: UInt64(0), cur: 1, dt: 0) == nil)
+        precondition(rate(prev: UInt64(0), cur: 1, dt: .infinity) == nil)
+        precondition(rate(prev: Int64(-1), cur: 1, dt: 2) == nil)
+        precondition(dnsVerdict([]) == .unknown)
+        precondition(dnsVerdict(["192.0.2.1"]) == .unknown)
+        precondition(dnsVerdict(["198.18.0.1", "127.0.0.1"]) == .proxyOK)
+        precondition(dnsVerdict(["198.19.255.254"]) == .proxyOK)
+        precondition(dnsVerdict(["198.20.0.1"]) == .unknown)
+        precondition(dnsVerdict(["198.18.0.999"]) == .unknown)
+        precondition(dnsVerdict(["127.0.0.1", "192.0.2.1"]) == .unknown)
+        // 这是 DNS 规则中必须识别的公共服务地址，不是本机或节点地址。
+        precondition(dnsVerdict(["127.0.0.1", "223.5.5.5"]) == .domesticWarning)
+        let dns = "nameserver[0] : 203.0.113.1\nresolver #11\n nameserver[0] : 203.0.113.2\nresolver #1\n nameserver[0] : 192.0.2.1\n nameserver[1] : 198.51.100.1\nresolver #2\n nameserver[0] : 203.0.113.3"
+        precondition(NetworkScanner.parseDNS(dns) == ["192.0.2.1", "198.51.100.1"])
+        precondition(NetworkScanner.parseDNS("resolver #1\n nameserver[0] : 192.0.2.1\nresolver #1\n nameserver[0] : 203.0.113.1") == ["192.0.2.1"])
+        let counters = NetworkScanner.parseNetstat("Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\nen0 1500 <Link#1> fixture 1 0 1024 2 0 2048 0", iface: "en0")!
+        precondition(counters.input == 1024 && counters.output == 2048)
+        precondition(NetworkScanner.parseNetstat("no counters", iface: "en0") == nil)
+        precondition(NetworkScanner.isGlobalIPv6("2001:db8::1"))
+        precondition(!NetworkScanner.isGlobalIPv6("fe80::1") && !NetworkScanner.isGlobalIPv6("fd00::1"))
+        precondition(NetworkScanner.validatedClashURL("http://127.0.0.1:9090") != nil)
+        precondition(NetworkScanner.validatedClashURL("http://localhost:9090")?.host == "127.0.0.1")
+        precondition(NetworkScanner.validatedClashURL("http://192.0.2.1:9090") == nil)
+        precondition(NetworkScanner.validatedClashURL("http://127.0.0.1:9090/?url=fixture") == nil)
+        let connections = NetworkScanner.parseConnections(["connections": [
+            ["metadata": ["host": "API.OPENAI.COM."], "chains": ["fixture-exit", "fixture-select"], "rule": "DomainSuffix", "rulePayload": "openai.com"],
+            ["metadata": ["host": "api.openai.com"], "chains": ["fixture-exit", "fixture-select"]],
+            ["metadata": ["host": "chatgpt.com"], "chains": ["fixture-direct"]],
+            ["metadata": ["host": "generativelanguage.googleapis.com"], "chains": ["fixture-gemini"]],
+            ["metadata": ["host": "notopenai.com"], "chains": ["fixture-unmatched"]]
+        ]])!
+        let api = connections.first { $0.name == "OpenAI API" }!
+        precondition(api.count == 2 && api.chains == ["fixture-exit → fixture-select"] && api.rules == ["DomainSuffix:openai.com"])
+        precondition(connections.first { $0.name == "ChatGPT/Codex" }?.count == 1)
+        precondition(connections.first { $0.name == "Gemini" }?.count == 1)
+        precondition(NetworkScanner.parseConnections([:]) == nil)
+        var first = AIExitStatus(id: "fixture", name: "Fixture AI", host: "example.test")
+        var second = first
+        second.ip = "192.0.2.1"; second.loc = "US"; second.capturedAt = 1
+        precondition(exitChange(previous: first, current: second) == nil)
+        first = second
+        precondition(exitChange(previous: first, current: second) == nil)
+        second.ip = "198.51.100.1"
+        precondition(exitChange(previous: first, current: second)?.isCountryChange == false)
+        second = first; second.loc = "JP"
+        precondition(exitChange(previous: first, current: second)?.isCountryChange == true)
+        precondition(AppDelegate.shouldNotifyExit(lastAt: nil, now: 1))
+        precondition(!AppDelegate.shouldNotifyExit(lastAt: 1, now: 600))
+        precondition(AppDelegate.shouldNotifyExit(lastAt: 1, now: 601))
+    }
+
+    do {
+        let suite = "vibegauge-selftest-" + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(2, forKey: "vg.tab")
+        DashboardView.migrateTabSelection(defaults: defaults)
+        precondition(defaults.integer(forKey: "vg.tab") == 4)
+        defaults.set(2, forKey: "vg.tab")
+        DashboardView.migrateTabSelection(defaults: defaults)
+        precondition(defaults.integer(forKey: "vg.tab") == 2, "迁移只能执行一次")
+    }
+
+    do {
+        precondition(UsageHistory.levels([]) == [])
+        precondition(UsageHistory.levels([0, 0, -1]) == [0, 0, 0])
+        precondition(UsageHistory.levels([0, 1, 2, 3, 4, 5]) == [0, 1, 2, 3, 4, 5])
+        precondition(Set(UsageHistory.levels([10, 10, 10])).count == 1)
+        let boundary = Fmt.parseISODate("2026-09-18T16:00:00Z")!
+        let zone = TimeZone(identifier: "Asia/Shanghai")!
+        precondition(UsageHistory.dayKey(timestamp: boundary, timeZone: zone) == "2026-09-19")
+        precondition(UsageHistory.dayKey(timestamp: boundary - 1, timeZone: zone) == "2026-09-18")
+        precondition(UsageHistory.dayKey(timestamp: boundary, timeZone: TimeZone(secondsFromGMT: 0)!) == "2026-09-18")
+        let last = UsageHistory.codexLastTokenUsage(["input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 10, "reasoning_output_tokens": 2])
+        precondition(last.ctx == 100 && last.cacheRead == 40 && last.out == 10 && last.think == 2)
+        let delta = UsageHistory.codexCumulativeDelta(previous: ["input_tokens": 100, "output_tokens": 10], current: ["input_tokens": 130, "output_tokens": 15])!
+        precondition(delta.ctx == 30 && delta.out == 5)
+        precondition(UsageHistory.codexCumulativeDelta(previous: ["input_tokens": 100], current: ["input_tokens": 10]) == nil)
+        var prior: [String: Int64]?
+        let one: [String: Int64] = ["input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 10]
+        let two: [String: Int64] = ["input_tokens": 200, "cached_input_tokens": 80, "output_tokens": 20]
+        precondition(UsageHistory.codexUsage(info: ["last_token_usage": one, "total_token_usage": one], previous: &prior)?.usage.ctx == 100)
+        precondition(UsageHistory.codexUsage(info: ["last_token_usage": one, "total_token_usage": two], previous: &prior)?.usage.ctx == 100)
+        precondition(UsageHistory.codexUsage(info: ["last_token_usage": one, "total_token_usage": two], previous: &prior) == nil)
+        precondition(UsageHistory.codexUsage(info: [:], previous: &prior) == nil)
+        let a = UsageHistory.Record(id: "fixture-request", source: "Claude", timestamp: boundary, model: "fixture-model", usage: last)
+        var updated = a; updated.usage.out = 20
+        let merged = UsageHistory.deduplicateClaude(["file-a": [a, updated], "file-b": [updated]])
+        precondition(merged.count == 1 && merged[a.id]?.usage.out == 20)
+        precondition(Fmt.tokens(10_000) == "1.0 万" && Fmt.tokens(100_000_000) == "1.00 亿")
+    }
+
+    // 临时目录覆盖真实增量路径：重启、跨文件去重、追加半行、重写、模型成本重算。
+    do {
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("vibegauge-history-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        func write(_ relative: String, _ text: String, append: Bool = false) throws {
+            let url = root.appendingPathComponent(relative)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if append {
+                let handle = try FileHandle(forWritingTo: url); defer { try? handle.close() }
+                try handle.seekToEnd(); try handle.write(contentsOf: Data(text.utf8))
+            } else { try Data(text.utf8).write(to: url) }
+        }
+        func line(_ object: [String: Any]) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), as: UTF8.self) + "\n"
+        }
+        func claude(_ id: String, _ ts: String, _ input: Int, _ output: Int, read: Int = 0, cacheWrite: Int = 0) throws -> String {
+            try line(["type": "assistant", "timestamp": ts, "requestId": id, "message": ["model": "fixture-priced", "usage": ["input_tokens": input, "cache_read_input_tokens": read, "cache_creation_input_tokens": cacheWrite, "output_tokens": output]]])
+        }
+        func codex(_ ts: String, total: [String: Int], last: [String: Int]? = nil) throws -> String {
+            var info: [String: Any] = ["total_token_usage": total]
+            if let last { info["last_token_usage"] = last }
+            return try line(["type": "event_msg", "timestamp": ts, "payload": ["type": "token_count", "info": info]])
+        }
+        let before = "2026-09-18T15:59:59Z", after = "2026-09-18T16:00:01Z"
+        let ca = ".claude/projects/fixture/a.jsonl", cb = ".claude/projects/fixture/b.jsonl"
+        let codexA = ".codex/sessions/2026/09/18/a.jsonl", codexB = ".codex/sessions/2026/09/18/b.jsonl"
+        let request = try claude("fixture-1", before, 10, 6, read: 20, cacheWrite: 5)
+        try write(ca, try claude("fixture-1", before, 10, 3, read: 20, cacheWrite: 5) + request + claude("fixture-2", after, 10, 4))
+        try write(cb, request)
+        let u1 = ["input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 10]
+        let u2 = ["input_tokens": 200, "cached_input_tokens": 80, "output_tokens": 20]
+        let u3 = ["input_tokens": 240, "cached_input_tokens": 96, "output_tokens": 24]
+        try write(codexA, try line(["type": "turn_context", "payload": ["model": "fixture-priced"]])
+                  + codex(before, total: u1, last: u1) + codex(after, total: u2, last: u1)
+                  + codex(after, total: u2, last: u1) + codex(after, total: u3)
+                  + line(["type": "event_msg", "timestamp": after, "payload": ["type": "token_count", "info": NSNull()]]))
+        try write(codexB, try codex(before, total: ["input_tokens": 50, "cached_input_tokens": 10, "output_tokens": 5])
+                  + codex(after, total: ["input_tokens": 80, "cached_input_tokens": 16, "output_tokens": 8]))
+        try write(".config/vibegauge/api-calls.jsonl", try line(["ts": after, "host": "example.test", "provider": "Fixture A", "model": "fixture-priced", "ctx": 30, "cache_read": 5, "out": 3])
+                  + line(["ts": after, "host": "example.test", "provider": "Fixture B", "model": "fixture-unpriced", "ctx": 50, "cache_write": 10, "out": 4]))
+        let collector = UsageHistory(home: root.path)
+        collector.scanNowForTesting()
+        var snap = collector.snapshot()
+        precondition(snap.totals["Claude"]?.ctx == 45 && snap.totals["Claude"]?.out == 10 && snap.totals["Claude"]?.turns == 2 && snap.totals["Claude"]?.sessions == 2)
+        precondition(snap.totals["Codex"]?.ctx == 320 && snap.totals["Codex"]?.out == 32 && snap.totals["Codex"]?.turns == 5 && snap.totals["Codex"]?.sessions == 2)
+        precondition(snap.totals["API · Fixture A"]?.ctx == 30 && snap.totals["API · Fixture B"]?.ctx == 50)
+        precondition(snap.cost == nil && !snap.hasPriceTable && snap.error.isEmpty)
+        let cacheURL = root.appendingPathComponent(".config/vibegauge/usage-daily.json")
+        let disk = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as! [String: Any]
+        let states = disk["files"] as! [String: [String: Any]]
+        let codexSize = try Data(contentsOf: root.appendingPathComponent(codexA)).count
+        let codexStates = states.filter { $0.key.hasSuffix("/" + codexA) }
+        precondition(codexStates.count == 1 && (codexStates.first?.value["offset"] as? NSNumber)?.intValue == codexSize)
+        // 人工测试价目表只作用于临时目录中的 fixture 模型，不提供任何生产默认价格。
+        try write(".config/vibegauge/prices.json", try line(["_currency": "TEST", "fixture-priced": ["in": 1, "cache_read": 2, "cache_write": 3, "out": 4]]))
+        collector.scanNowForTesting(); snap = collector.snapshot()
+        precondition(abs((snap.cost ?? -1) - 0.000594) < 1e-10 && snap.unpricedModels == 2)
+        try write(".config/vibegauge/prices.json", try line(["_currency": "TEST", "fixture-priced": ["in": 2, "cache_read": 4, "cache_write": 6, "out": 8]]))
+        collector.scanNowForTesting()
+        precondition(abs((collector.snapshot().cost ?? -1) - 0.001188) < 1e-10)
+        let added = try claude("fixture-3", after, 7, 1)
+        let split = added.index(added.startIndex, offsetBy: added.count / 2)
+        try write(ca, String(added[..<split]), append: true)
+        collector.scanNowForTesting()
+        precondition(collector.snapshot().totals["Claude"]?.turns == 2, "半行不能提前计入")
+        try write(ca, String(added[split...]), append: true)
+        collector.scanNowForTesting()
+        precondition(collector.snapshot().totals["Claude"]?.turns == 3)
+        try write(cb, try claude("fixture-4", after, 10, 2))
+        try write(ca, try claude("fixture-5", after, 3, 1))
+        collector.scanNowForTesting(); snap = collector.snapshot()
+        precondition(snap.totals["Claude"]?.turns == 2 && snap.totals["Claude"]?.ctx == 13, "重写必须撤销旧文件贡献")
+        let restarted = UsageHistory(home: root.path)
+        restarted.scanNowForTesting()
+        precondition(restarted.snapshot().totals == snap.totals && restarted.snapshot().error.isEmpty)
+    } catch { preconditionFailure("统计临时日志自测失败：\(error)") }
+
+    NetworkScanner.shared.start()
+    UsageHistory.shared.start()
+
     let t0 = Date()
-    let r = ProcessScanner.shared.scan()
+    let r = ProcessScanner.shared.scan(refreshRemote: false)
     let t1 = Date()
     print(String(format: "scan 耗时 %.0f ms", t1.timeIntervalSince(t0) * 1000))
     print(String(format: "内存 可用%d%%  已用 %.1f/%.1f GB  swap %.2f GB  压缩 %.2f GB", r.freePercentage, r.usedMemoryGB, r.totalMemoryGB, r.swapUsedGB, r.compressorGB))
@@ -287,6 +471,49 @@ if CommandLine.arguments.contains("--selftest") {
     _ = ProcessScanner.shared.scanTokens()
     _ = ProcessScanner.shared.scanActiveLLMs()
     print(String(format: "二次轻量刷新耗时 %.0f ms (ticker 每秒跑的就是这个)", Date().timeIntervalSince(t2) * 1000))
+    let historyDeadline = Date().addingTimeInterval(600)
+    var progressAt = Date.distantPast
+    while UsageHistory.shared.snapshot().capturedAt == 0 || NetworkScanner.shared.snapshot().capturedAt == 0 {
+        precondition(Date() < historyDeadline, "后台首次采集超时，不能把未完成汇总标为通过")
+        if Date().timeIntervalSince(progressAt) > 15 {
+            let progress = UsageHistory.shared.snapshot()
+            print("历史汇总进度：\(progress.processedFiles)/\(progress.totalFiles) 文件")
+            progressAt = Date()
+        }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+    }
+    func maskedIP(_ ip: String) -> String {
+        if ip.contains(":") { return ip.split(separator: ":").prefix(2).joined(separator: ":") + ":x:x" }
+        let parts = ip.split(separator: ".")
+        return parts.count == 4 ? parts.prefix(2).joined(separator: ".") + ".x.x" : "查不到"
+    }
+    precondition(maskedIP("192.0.2.7") == "192.0.x.x")
+    let network = NetworkScanner.shared.snapshot()
+    print("--- 网络 ---")
+    for item in network.aiExits where !item.isGemini {
+        if item.error.isEmpty {
+            print("\(item.name): \(maskedIP(item.ip)) · \(item.loc) · \(item.colo) · \(item.latencyMS)ms")
+        } else { print("\(item.name): 查不到 · \(item.error)") }
+    }
+    let gemini = network.proxy.connections.first { $0.name == "Gemini" }
+    print("Gemini: " + (!network.proxy.error.isEmpty ? "查不到出口：代理连接表不可用" : ((gemini?.count ?? 0) > 0 ? "\(gemini!.count) 个活动连接 · 出站链路 \(gemini!.chains.count) 条" : "无活动连接，查不到出口")))
+    print("代理内核: " + (network.proxy.error.isEmpty ? "\(network.proxy.version) · \(network.proxy.groups.count) 个分组" : network.proxy.error))
+    print("本机: \(network.local.interfaceName.isEmpty ? "查不到接口" : network.local.interfaceName) · 网关 \(maskedIP(network.local.gateway)) · IPv4 \(maskedIP(network.local.ipv4))")
+    print("IPv6: \(network.leak.ipv6Message)" + (network.leak.ipv6Country.isEmpty ? "" : " · \(network.leak.ipv6Country)"))
+    print("DNS: \(network.leak.dnsVerdict.rawValue)")
+    let history = UsageHistory.shared.snapshot()
+    print("--- 统计 ---")
+    print("已处理 \(history.processedFiles)/\(history.totalFiles) 文件 · 自 \(history.earliestDate ?? "查不到最早日期") · \(history.activeDays) 个活跃日")
+    print("累计 token \(history.tokenTotal) · 输入 \(history.ctx) · 缓存读 \(history.cacheRead) · 输出 \(history.aggregate.out)")
+    print("缓存命中率 " + (history.cacheHitRate.map { String(format: "%.2f%%", $0 * 100) } ?? "查不到：无输入用量"))
+    for source in ["Claude", "Codex"] {
+        if let total = history.totals[source] { print("\(source): \(total.tokenTotal) token · \(total.turns) 请求 · \(total.sessions) 会话") }
+        else { print("\(source): 未检测到有效用量记录") }
+    }
+    print("API 上游 \(history.totals.keys.filter { $0.hasPrefix("API · ") }.count) 个 · 累计差口径 \(history.cumulativeTurns) 次 · 跳过不完整记录 \(history.skippedRecords) 条")
+    print("API 等价成本: " + (history.hasPriceTable ? (history.cost.map { String(format: "%.4f %@", $0, history.priceCurrency) } ?? "未定价") + (history.unpricedModels > 0 ? " · 部分模型未定价" : "") : "未配置价目表"))
+    if !history.error.isEmpty { print("汇总说明：\(history.error)") }
+    print("新增纯函数、Tab 迁移和增量缓存自测通过")
     exit(0)
 }
 

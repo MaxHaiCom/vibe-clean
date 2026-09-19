@@ -18,6 +18,10 @@ swiftc -O \
     -framework UserNotifications \
     Sources/ProcessScanner.swift \
     Sources/ProxyManager.swift \
+    Sources/NetworkScanner.swift \
+    Sources/NetworkTabView.swift \
+    Sources/UsageHistory.swift \
+    Sources/StatsTabView.swift \
     Sources/DashboardView.swift \
     Sources/AppDelegate.swift \
     Sources/main.swift \
